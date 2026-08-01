@@ -21,6 +21,7 @@ inputs of .github/workflows/_build.yml, so a workflow can do:
 Usage:
     python ci/generate_matrix.py --component apex
     python ci/generate_matrix.py --component all
+    python ci/generate_matrix.py --component flash-attention --arch aarch64
     python ci/generate_matrix.py --list-components
     python ci/generate_matrix.py --component apex --github-output
 """
@@ -346,6 +347,15 @@ def main() -> None:
         help="Component name from versions.yaml, or 'all' (default) for every component.",
     )
     parser.add_argument(
+        "--arch",
+        default="all",
+        help=(
+            "Restrict the matrix to one build_matrix arch (e.g. aarch64), or 'all' "
+            "(default) for every arch each component opts into. Useful to test one "
+            "arch without also spending a runner on the others."
+        ),
+    )
+    parser.add_argument(
         "--list-components",
         action="store_true",
         help="Print known component names (one per line) and exit.",
@@ -385,6 +395,17 @@ def main() -> None:
         components = components_needing_build(versions, components, args.repo)
 
     matrix = build_full_matrix(versions, components)
+
+    if args.arch != "all":
+        available = matrix_arches(versions)
+        if args.arch not in available:
+            parser.error(f"Unknown arch {args.arch!r}. Known arches: {', '.join(available)}, all")
+        # An empty result is expected and fine here (e.g. --component apex
+        # --arch aarch64, for a component that opts out of that arch): the
+        # has_builds output below lets the calling workflow skip its build job
+        # rather than fail on an empty matrix.
+        matrix = [entry for entry in matrix if entry["arch"] == args.arch]
+
     payload = json.dumps(matrix)
     print(payload)
 

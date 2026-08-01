@@ -198,6 +198,16 @@ To turn arm64 on for a component:
    python3 ci/release_meta.py --component <name>
    ```
 
+6. Smoke-test the new arch on its own before letting a push build both:
+   trigger `build-<component>.yml` from the Actions tab and set its **arch**
+   input to that arch. `workflow_dispatch` runs build without publishing, and
+   the arch filter keeps the other arches off the runners entirely. The same
+   filter is available locally:
+
+   ```bash
+   python3 ci/generate_matrix.py --component <name> --arch aarch64
+   ```
+
 Adding an arch to a component changes its release title, which is what makes
 the next push rebuild it (the skip check requires an exact title match *and*
 a wheel per package per arch, matched on each wheel's platform tag). Titles

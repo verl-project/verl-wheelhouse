@@ -87,6 +87,12 @@ wheel - make the build script skip that wheel when `$TARGET_ARCH` is not
 asserts the runner's `uname -m` matches the row's arch. No other change is
 needed; CUDA, cuDNN, NCCL and torch installation are already arch-aware.
 
+Each arch is a separate job. To build just one, dispatch
+`build-<component>.yml` with its `arch` input (or pass
+`--arch <arch>` to `ci/generate_matrix.py` locally); pushes always build
+every arch. When adding a new arch to `build_matrix`, extend the static
+`options:` list of every workflow's `arch` dispatch input to match.
+
 ## Arch-list conventions
 
 `torch_cuda_arch_list` in `versions.yaml` is canonical dotted+semicolon form

@@ -133,6 +133,13 @@ historical record.
   automatically on pushes to `main` (including PR merges) that touch
   `versions.yaml`, `ci/generate_matrix.py`, `ci/build_scripts/common.sh`, or
   that component's build script.
+- Every arch/CUDA/Python/Torch combination is an independent job on its own
+  runner, with its own build cache and wheel artifact, and `fail-fast: false`
+  keeps one failure from cancelling the others. A manual run additionally
+  takes an **arch** choice (`all` / `x86_64` / `aarch64`), so you can test one
+  architecture without spending hours of runner time on the others; a
+  component that doesn't opt into the chosen arch simply has nothing to build
+  and its build job is skipped. Pushes always build every arch.
 - On a push, the workflow first checks the component's target release. If its
   title exactly matches the configured arch/CUDA/Python/Torch matrix and it
   contains every distribution listed in that component's `wheel_packages` for
@@ -142,8 +149,9 @@ historical record.
   the wheel(s), and re-runs `publish-index.yml`. Manual `workflow_dispatch`
   runs always build but skip publishing, so they can force a fresh test build.
 - `build-all.yml` builds every component and also runs on a weekly schedule
-  as a sanity sweep. It does **not** publish - it's for validating the whole
-  matrix still builds cleanly.
+  as a sanity sweep (the schedule always covers every arch; a manual run
+  takes the same arch choice as the per-component workflows). It does **not**
+  publish - it's for validating the whole matrix still builds cleanly.
 - Pushing a tag matching `v*` runs `release.yml`, which is purely a
   trigger - the tag itself is not a release. It runs the full component x
   matrix sweep and, for every component, ensures/updates that same
