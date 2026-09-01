@@ -149,6 +149,41 @@ ensure_cuda_cccl_include_path() {
 }
 
 # ---------------------------------------------------------------------------
+# ensure_cuda_stub_library_path: put the toolkit's libcuda.so stub on the link
+# path.
+#
+# deep-ep's hybrid_ep extension declares libraries=["cuda"], i.e. it links the
+# CUDA driver API. Build machines have no NVIDIA driver, so that resolves
+# against the toolkit's stub instead - harmless, because what ends up recorded
+# in the .so is the real SONAME libcuda.so.1, which the GPU host provides at run
+# time. torch's cpp_extension only ever adds $CUDA_HOME/lib64 to the link path,
+# never lib64/stubs, so point the linker there via LIBRARY_PATH (link-time only:
+# unlike an -rpath it leaves nothing behind in the built object). The stub
+# itself comes from the driver-dev sub-package installed by _build.yml.
+# ---------------------------------------------------------------------------
+ensure_cuda_stub_library_path() {
+  local cuda_home target stub_dir
+  cuda_home="${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}"
+  case "$(uname -m)" in
+    aarch64) target="sbsa-linux" ;;
+    *) target="x86_64-linux" ;;
+  esac
+
+  for stub_dir in \
+    "${cuda_home}/lib64/stubs" \
+    "${cuda_home}/targets/${target}/lib/stubs"; do
+    if [ -e "${stub_dir}/libcuda.so" ]; then
+      export LIBRARY_PATH="${stub_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+      echo "CUDA driver stub: added ${stub_dir} to LIBRARY_PATH"
+      return 0
+    fi
+  done
+
+  echo "::error::No libcuda.so stub under ${cuda_home}; is the cuda-toolkit driver-dev sub-package installed?" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # install_nvshmem: install NVIDIA's NVSHMEM pip package at the same absolute
 # path verl's runtime image puts it, and export NVSHMEM_DIR pointing there.
 #
