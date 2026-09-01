@@ -91,6 +91,30 @@ install_nccl() {
 }
 
 # ---------------------------------------------------------------------------
+# install_rdma_devel: userspace RDMA/InfiniBand headers and libraries.
+#
+# deep-ep's csrc/kernels/configs.cuh includes <infiniband/mlx5dv.h> for its
+# IBGDA path, so every translation unit that pulls configs.cuh in - the .cpp as
+# well as the .cu files - fails to compile without these. GitHub's runner images
+# don't carry them; verl's docker/Dockerfile.uv.cu130 apt-installs the same set
+# in its base stage (its "RDMA/IB" superset of the sglang/vllm basic stages).
+#
+# libibverbs-dev is the one that actually matters (it ships
+# /usr/include/infiniband/mlx5dv.h alongside verbs.h); librdmacm-dev and
+# ibverbs-providers come along to mirror that image, the latter supplying the
+# libmlx5 provider itself.
+# ---------------------------------------------------------------------------
+install_rdma_devel() {
+  echo "::group::Install RDMA/InfiniBand development packages"
+  maybe_sudo apt-get update
+  maybe_sudo apt-get install -y --no-install-recommends \
+    libibverbs-dev \
+    librdmacm-dev \
+    ibverbs-providers
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # ensure_cuda_cccl_include_path: put CUDA 13's CCCL headers on CPATH.
 #
 # CUDA 13 moved libcu++ / cub / thrust out of the toolkit's top-level include/
