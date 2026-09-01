@@ -30,6 +30,7 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version
 # NVSHMEM_DIR set, setup.py silently falls back to -DDISABLE_NVSHMEM and builds
 # a wheel with those kernels compiled out.
 ensure_cuda_cccl_include_path
+ensure_cuda_stub_library_path
 install_rdma_devel
 install_nvshmem
 
@@ -43,8 +44,11 @@ install_nvshmem
 # future ref changes the default.
 export DISABLE_AGGRESSIVE_PTX_INSTRS=1
 
-# The hybrid_ep extension links -lnvtx3interop, which ships in the CUDA
-# toolkit's nvtx package (installed by _build.yml's Jimver/cuda-toolkit step).
+# The hybrid_ep extension links -lnvtx3interop and -lcuda. Both come from the
+# toolkit _build.yml installs: libnvtx3interop.so from its nvtx sub-package
+# (in targets/<t>/lib, which $CUDA_HOME/lib64 symlinks to, and which torch puts
+# on the link path), and the libcuda.so stub from driver-dev, reached via the
+# LIBRARY_PATH set above.
 mkdir -p dist
 MAX_JOBS="${MAX_JOBS}" pip wheel -v \
   --no-build-isolation \
