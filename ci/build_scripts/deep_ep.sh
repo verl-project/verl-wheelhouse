@@ -24,11 +24,13 @@ pip install -q ninja packaging wheel setuptools
 # run --no-build-isolation against the torch the workflow installed.
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
 
-# Host-compiler include path for CUDA 13's relocated libcu++/cub/thrust, and
+# Host-compiler include path for CUDA 13's relocated libcu++/cub/thrust, the
+# <infiniband/mlx5dv.h> that csrc/kernels/configs.cuh includes for IBGDA, and
 # NVSHMEM (headers + libs) for the internode / low-latency kernels. Without
 # NVSHMEM_DIR set, setup.py silently falls back to -DDISABLE_NVSHMEM and builds
 # a wheel with those kernels compiled out.
 ensure_cuda_cccl_include_path
+install_rdma_devel
 install_nvshmem
 
 # TORCH_CUDA_ARCH_LIST is already in the environment (_build.yml's "Build wheel"
