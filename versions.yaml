@@ -77,7 +77,9 @@ verl_reference_versions:
 # wheel_packages:  distribution names expected in the component's release.
 #                  Push builds are skipped only when every listed package has
 #                  a wheel and the release title matches the target dependency
-#                  matrix exactly.
+#                  matrix exactly, including torch_cuda_arch_list (the title's
+#                  `sm...` token). Bumping the GPU arch list therefore rebuilds
+#                  the same ref; components with null omit the token.
 # torch_cuda_arch_list: canonical arch list, e.g. "8.0;9.0;10.0;12.0" (or
 #                  null if the component hardcodes its own gencode flags).
 #                  ci/build_scripts/common.sh converts this per-component as

@@ -122,9 +122,11 @@ every arch. When adding a new arch to `build_matrix`, extend the static
 
 Each component publishes to its **own** persistent GitHub Release (no
 single combined release for the whole repo): tag `<component>-<ref>`,
-title `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]`
+title `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[ sm..][; ...]`
 (one segment per `versions.yaml` `build_matrix` entry the component is built
-for, with the `x86_64` arch left implicit). This is computed by
+for, with the `x86_64` arch left implicit and `sm...` the GPU arch list).
+Bumping `torch_cuda_arch_list` therefore changes the title and rebuilds the
+same ref - the skip check requires an exact title match. This is computed by
 `ci/release_meta.py` and created/refreshed by the reusable
 `.github/workflows/_ensure_release.yml` workflow - don't hand-roll
 `gh release create`/`edit` calls elsewhere. Bumping a component's `ref`

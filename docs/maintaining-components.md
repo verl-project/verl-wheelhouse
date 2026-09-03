@@ -217,11 +217,15 @@ To turn arm64 on for a component:
    python3 ci/generate_matrix.py --component <name> --arch aarch64
    ```
 
-Adding an arch to a component changes its release title, which is what makes
-the next push rebuild it (the skip check requires an exact title match *and*
-a wheel per package per arch, matched on each wheel's platform tag). Titles
-leave `x86_64` implicit, so x86_64-only components keep their existing titles
-and are not disturbed when a new arch enters `build_matrix`.
+Adding an arch to a component, or changing `torch_cuda_arch_list`, changes
+its release title, which is what makes the next push rebuild it (the skip
+check requires an exact title match *and* a wheel per package per arch,
+matched on each wheel's platform tag). Titles leave `x86_64` implicit, so
+x86_64-only components keep their existing titles and are not disturbed when
+a new arch enters `build_matrix`. Components with `torch_cuda_arch_list:
+null` omit the `sm...` token for the same reason. Wheel filenames stay
+PEP-normal, so existing pip/uv URLs keep working across a gencode-only
+rebuild (`--clobber` overwrites the same asset name).
 
 The rest of the toolchain is already arch-agnostic: `Jimver/cuda-toolkit`
 switches its apt repo to NVIDIA's `sbsa` path on arm64, `common.sh`'s

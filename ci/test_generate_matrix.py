@@ -53,6 +53,43 @@ class ExistingReleaseTests(unittest.TestCase):
         self.assertFalse(covered)
         self.assertIn("demo-helper", reason)
 
+    def test_cuda_arch_list_is_part_of_the_release_title(self) -> None:
+        self.versions["components"]["demo"]["torch_cuda_arch_list"] = "8.0;9.0;10.0"
+        covered, reason = generate_matrix.release_covers_component(
+            self.versions, "demo", self.release
+        )
+        self.assertFalse(covered)
+        self.assertIn("sm8.0;9.0;10.0", reason)
+
+    def test_cuda_arch_override_is_per_cpu_arch(self) -> None:
+        self.versions["build_matrix"].append(
+            {
+                "arch": "aarch64",
+                "cuda": "13.0.2",
+                "python": "3.12",
+                "torch": "2.11.0",
+            }
+        )
+        self.versions["components"]["demo"]["torch_cuda_arch_list"] = "8.0;9.0;10.0"
+        self.versions["components"]["demo"]["arch_overrides"] = {
+            "aarch64": {"torch_cuda_arch_list": "9.0;10.0"}
+        }
+        title = generate_matrix.release_title(
+            "v1.2.3",
+            "demo",
+            generate_matrix.component_combos(self.versions, "demo"),
+            self.versions,
+        )
+        self.assertIn("cu13.0.2 py3.12 torch2.11.0 sm8.0;9.0;10.0", title)
+        self.assertIn("aarch64 cu13.0.2 py3.12 torch2.11.0 sm9.0;10.0", title)
+
+    def test_null_cuda_arch_list_keeps_the_existing_title(self) -> None:
+        self.versions["components"]["demo"]["torch_cuda_arch_list"] = None
+        covered, _ = generate_matrix.release_covers_component(
+            self.versions, "demo", self.release
+        )
+        self.assertTrue(covered)
+
     @patch("generate_matrix.inspect_release")
     def test_matching_component_is_removed_from_builds(self, inspect_release) -> None:
         inspect_release.return_value = self.release

@@ -29,7 +29,7 @@ resumable build caches).
 
 Wheels are published to [GitHub Releases](../../releases) - one persistent
 release per component, named after that component and its pinned dependency
-versions (e.g. `transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.11.0`, tag
+versions (e.g. `transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.11.0 sm8.0;9.0;10.0`, tag
 `transformer-engine-v2.16.1`) - and to a static [GitHub Pages](https://pages.github.com/)
 PEP 503 "simple" package index, so they're directly `pip install`-able.
 
@@ -123,11 +123,15 @@ combined release for "the repo" as a whole. `ci/release_meta.py` computes,
 for a component and its currently-pinned `ref` in `versions.yaml`:
 
 - **tag**: `<component>-<ref>`, e.g. `transformer-engine-v2.16.1`
-- **title**: `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]`
+- **title**: `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[ sm..][; ...]`
   (one segment per `build_matrix` entry the component is built for, with the
-  `x86_64` arch left implicit), e.g. `transformer-engine v2.16.1 - cu13.0.2
-  py3.12 torch2.11.0` or `flash-attention v2.8.3 - cu13.0.2 py3.12
-  torch2.11.0; aarch64 cu13.0.2 py3.12 torch2.11.0`
+  `x86_64` arch left implicit and `sm...` the GPU arch list from
+  `torch_cuda_arch_list`, so a gencode bump rebuilds the same ref). e.g.
+  `transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.11.0 sm8.0;9.0;10.0`
+  or `flash-attention v2.8.3 - cu13.0.2 py3.12 torch2.11.0 sm8.0;9.0;10.0;12.0;
+  aarch64 cu13.0.2 py3.12 torch2.11.0 sm9.0;10.0`. Components with
+  `torch_cuda_arch_list: null` omit the `sm...` token and keep their previous
+  titles.
 
 The reusable `.github/workflows/_ensure_release.yml` workflow creates that
 release if it doesn't exist yet, or refreshes its title (in case

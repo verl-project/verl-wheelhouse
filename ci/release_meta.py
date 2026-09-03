@@ -7,10 +7,11 @@ component's currently-pinned ref rather than by a shared "latest"/repo-level
 tag:
 
     tag:   "<component>-<ref>"                     e.g. "transformer-engine-v2.16.1"
-    title: "<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]"
+    title: "<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[ sm..][; ...]"
            (one segment per versions.yaml build_matrix entry the component is
-           built for, with the x86_64 arch left implicit) e.g.
-           "transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.11.0"
+           built for, with the x86_64 arch left implicit; sm... is the GPU
+           arch list so skip detection rebuilds when it changes) e.g.
+           "transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.11.0 sm8.0;9.0;10.0"
 
 Rebuilding the same ref re-uploads (--clobber) wheels onto the same
 release; bumping a component's ref in versions.yaml starts a brand new
@@ -56,7 +57,9 @@ def component_release_meta(versions: Dict[str, Any], component: str) -> Dict[str
         "component": component,
         "ref": ref,
         "tag": release_tag(component, ref),
-        "title": release_title(ref, component, component_combos(versions, component)),
+        "title": release_title(
+            ref, component, component_combos(versions, component), versions
+        ),
         "notes": release_notes(component, ref),
     }
 

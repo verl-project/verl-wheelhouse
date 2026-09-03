@@ -165,21 +165,67 @@ def release_tag(component: str, ref: str) -> str:
     return f"{component}-{sanitize_ref(ref)}"
 
 
-def release_title(ref: str, component: str, combos: List[Dict[str, Any]]) -> str:
+def component_torch_cuda_arch_list(
+    versions: Dict[str, Any], component: str, arch: str
+) -> Optional[str]:
+    """The GPU arch list one component compiles for `arch`, after overrides.
+
+    Separate from component_config so title/skip logic does not require
+    runs_on (tests and release_meta use this on partial fixtures).
+    """
+    cfg = dict(get_component(versions, component))
+    cfg.update((cfg.pop("arch_overrides", None) or {}).get(arch) or {})
+    value = cfg.get("torch_cuda_arch_list")
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def format_cuda_arch_title_suffix(arch_list: Optional[str]) -> str:
+    """Turn a versions.yaml arch list into the release-title `sm...` token.
+
+    Whitespace (flashinfer's space-separated form) is folded to `;` so the
+    title stays one token. Empty/null lists omit the suffix entirely -
+    components that hardcode their own gencodes (or build no CUDA) keep
+    their existing titles and are not rebuilt when this field is added.
+    """
+    if not arch_list:
+        return ""
+    compact = ";".join(str(arch_list).split())
+    return f" sm{compact}"
+
+
+def release_title(
+    ref: str,
+    component: str,
+    combos: List[Dict[str, Any]],
+    versions: Optional[Dict[str, Any]] = None,
+) -> str:
     """Describe the dependency combinations covered by a component release.
 
-    One "cu.. py.. torch.." segment per combination the component is built
-    for, prefixed by the arch for everything except DEFAULT_ARCH - x86_64 is
-    the baseline every component builds, so leaving it implicit keeps the
-    titles of x86_64-only releases stable (and their builds skippable) as
-    other arches are added to the matrix.
+    One "cu.. py.. torch..[ sm..]" segment per combination the component is
+    built for, prefixed by the arch for everything except DEFAULT_ARCH -
+    x86_64 is the baseline every component builds, so leaving it implicit
+    keeps the titles of x86_64-only releases stable (and their builds
+    skippable) as other arches are added to the matrix. The `sm...` token
+    is the GPU arch list from versions.yaml (after arch_overrides); skip
+    detection matches the title exactly, so bumping torch_cuda_arch_list
+    rebuilds the same ref the same way a CUDA/Python/Torch bump does.
+    Wheel filenames stay PEP-normal so existing pip/uv URLs keep working.
     """
-    segments = "; ".join(
-        f"{'' if combo_arch(combo) == DEFAULT_ARCH else combo_arch(combo) + ' '}"
-        f"cu{combo['cuda']} py{combo['python']} torch{combo['torch']}"
-        for combo in combos
-    )
-    return f"{component} {ref} - {segments}"
+    segments = []
+    for combo in combos:
+        arch = combo_arch(combo)
+        prefix = "" if arch == DEFAULT_ARCH else f"{arch} "
+        sm = ""
+        if versions is not None:
+            sm = format_cuda_arch_title_suffix(
+                component_torch_cuda_arch_list(versions, component, arch)
+            )
+        segments.append(
+            f"{prefix}cu{combo['cuda']} py{combo['python']} torch{combo['torch']}{sm}"
+        )
+    return f"{component} {ref} - {'; '.join(segments)}"
 
 
 def normalize_package_name(name: str) -> str:
@@ -213,7 +259,9 @@ def release_covers_component(
     """Check that a release has the exact dependency title and all expected wheels."""
     cfg = get_component(versions, component)
     ref = str(cfg["ref"])
-    expected_title = release_title(ref, component, component_combos(versions, component))
+    expected_title = release_title(
+        ref, component, component_combos(versions, component), versions
+    )
     actual_title = release.get("name")
     if actual_title != expected_title:
         return False, f"title mismatch: expected {expected_title!r}, found {actual_title!r}"
