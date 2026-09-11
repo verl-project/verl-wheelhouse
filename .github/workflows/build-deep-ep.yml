@@ -10,6 +10,14 @@ on:
         # Choices must be static, so this mirrors versions.yaml's build_matrix
         # arches by hand; generate_matrix.py rejects any that aren't in it.
         options: [all, x86_64, aarch64]
+      python:
+        description: "Python version to build (all = every version this component opts into)"
+        type: choice
+        default: all
+        # Static by hand, mirroring build_matrix's python versions; quoted
+        # because 3.11/3.12 would otherwise parse as YAML floats.
+        # generate_matrix.py rejects any version not in build_matrix.
+        options: [all, "3.11", "3.12"]
   push:
     branches: [main]
     paths:
@@ -46,13 +54,16 @@ jobs:
           # Only workflow_dispatch carries an arch choice; a push always
           # builds every arch the component opts into.
           ARCH: ${{ inputs.arch || 'all' }}
+          # Only workflow_dispatch carries a python choice; a push always
+          # builds every python version the component opts into.
+          PYTHON: ${{ inputs.python || 'all' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           args=()
           if [[ "$EVENT_NAME" == "push" ]]; then
             args+=(--skip-existing-releases --repo "$GITHUB_REPOSITORY")
           fi
-          python3 ci/generate_matrix.py --component deep-ep --arch "$ARCH" --github-output "${args[@]}"
+          python3 ci/generate_matrix.py --component deep-ep --arch "$ARCH" --python "$PYTHON" --github-output "${args[@]}"
 
   build:
     needs: compute-matrix

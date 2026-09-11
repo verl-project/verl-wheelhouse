@@ -21,8 +21,17 @@
 #   ARG TORCH_AUDIO_VERSION=2.11.0
 #
 # Every component in `components` below is built once per entry in this
-# list, minus the entries its `arches` filter excludes. Add another entry to
-# build additional arch/CUDA/Python/Torch combinations.
+# list, minus the entries its `arches` / `python_versions` filters exclude.
+# Add another entry to build additional arch/CUDA/Python/Torch combinations.
+#
+# 3.12 is the version verl's own Dockerfiles pin; 3.11 is built in addition
+# because torch 2.11.0 publishes cp311 cu130 wheels for both arches and
+# downstream verl envs still run 3.11. Components that compile CUDA
+# extensions therefore ship one wheel per interpreter, while components that
+# only emit a portable py3-none-any wheel (megatron-bridge, flashinfer) opt
+# out of 3.11 via `python_versions` below - one wheel installs on every
+# interpreter it supports and a second build would only re-upload an
+# identical asset.
 #
 # arch: the CPU architecture the wheel is built *for* and *on*, spelled the
 #       way `uname -m` reports it ("x86_64" or "aarch64"); _build.yml asserts
@@ -31,6 +40,14 @@
 #       so an x86_64 and an aarch64 wheel coexist on the same release and pip
 #       picks the right one. Omitting the field means "x86_64".
 build_matrix:
+  - arch: x86_64
+    cuda: "13.0.2"
+    python: "3.11"
+    torch: "2.11.0"
+    torch_vision: "0.26.0"
+    torch_audio: "2.11.0"
+    cxx11_abi: "TRUE"
+
   - arch: x86_64
     cuda: "13.0.2"
     python: "3.12"
@@ -47,6 +64,14 @@ build_matrix:
   # aarch64 -> sbsa, and download.pytorch.org publishes
   # manylinux_2_28_aarch64 CUDA wheels for this torch version. Components
   # opt in one at a time through `arches` below.
+  - arch: aarch64
+    cuda: "13.0.2"
+    python: "3.11"
+    torch: "2.11.0"
+    torch_vision: "0.26.0"
+    torch_audio: "2.11.0"
+    cxx11_abi: "TRUE"
+
   - arch: aarch64
     cuda: "13.0.2"
     python: "3.12"
@@ -132,6 +157,14 @@ verl_reference_versions:
 #                  ("ubuntu-24.04-arm" for aarch64): the only self-hosted
 #                  machine here is x86_64, so a self-hosted arm64 row would
 #                  queue forever. ci/generate_matrix.py rejects one outright.
+# python_versions: which build_matrix `python` values to build this component
+#                  for. Omit it to build for every python in build_matrix;
+#                  list a subset to opt out of the rest. Components that emit
+#                  only a portable py3-none-any wheel (megatron-bridge,
+#                  flashinfer) pin ["3.12"]: the wheel already installs on
+#                  every supported interpreter, and megatron-bridge's
+#                  requires-python is ">=3.12,<3.13" upstream anyway. A second
+#                  build would only race the same asset name onto the release.
 # build_timeout:   wall-clock budget for the compile step (e.g. 5h, 10h).
 # job_timeout_minutes: GitHub Actions job timeout for the whole build job;
 #                  must exceed build_timeout plus setup/cache-save overhead.
@@ -250,15 +283,22 @@ components:
         # consistent with the other components so it stays correct if
         # flashinfer-python ever grows a compiled component.
         torch_cuda_arch_list: "9.0a 10.0a"
+    # All three wheels are py3-none-any (the JIT Python core plus the prebuilt
+    # cubin/jit-cache data wheels), so they install on 3.11 as-is. Building
+    # them again on the 3.11 rows would produce byte-identical assets racing
+    # the same names onto the release, so this component stays 3.12-only even
+    # though it opts into both arches above.
+    python_versions: ["3.12"]
     extra_env: {}
 
   megatron-bridge:
     # NVIDIA-NeMo/Megatron-Bridge is a pure-Python training/conversion library
     # (it depends on megatron-core / TransformerEngine at *runtime*, but builds
     # no CUDA extensions of its own - no setup.py, no ext_modules). The result
-    # is a portable py3-none-any wheel; the build_matrix's CUDA/torch values are
-    # irrelevant to the artifact and only the Python interpreter matters
-    # (upstream pins requires-python ">=3.12,<3.13", matching build_matrix).
+    # is a portable py3-none-any wheel; the build_matrix's CUDA/torch values
+    # are irrelevant to the artifact. Upstream pins requires-python
+    # ">=3.12,<3.13", so even though build_matrix now also carries 3.11, this
+    # component is pinned to the 3.12 rows via python_versions below.
     path: Megatron-Bridge
     ref: r0.5.0 # NVIDIA-NeMo release branch for the 0.5.x line (moves as patch fixes land, like apex tracks master). Pin a v0.5.x tag instead for a frozen build.
     builder: megatron_bridge
@@ -277,6 +317,10 @@ components:
     # runner. (release_covers_component counts an "any" wheel for every arch,
     # so skip detection agrees.)
     arches: [x86_64]
+    # Upstream's requires-python is ">=3.12,<3.13" and the wheel is
+    # py3-none-any anyway, so there is neither a 3.11 build nor a need for
+    # one: the one 3.12 wheel already serves every interpreter it supports.
+    python_versions: ["3.12"]
     extra_env: {}
 
   deep-ep:

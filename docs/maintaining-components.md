@@ -99,7 +99,10 @@ Worked checklist, using a hypothetical `xformers` component as the example:
    ```
 
    Start with `arches: [x86_64]` and add arm64 as a follow-up once the
-   x86_64 build is green - see the next section.
+   x86_64 build is green - see the next section. No `python_versions` field
+   means the component builds for every interpreter in `build_matrix`
+   (3.11 and 3.12 today); add `python_versions: ["3.12"]` only if its wheel
+   is `py3-none-any` or upstream `requires-python` excludes 3.11.
 
 3. **Write `ci/build_scripts/xformers.sh`.** Use an existing script as a
    template (`ci/build_scripts/apex.sh` is a good default shape); every
@@ -238,6 +241,64 @@ switches its apt repo to NVIDIA's `sbsa` path on arm64, `common.sh`'s
 `install_cudnn` maps `aarch64` → `sbsa`, `install_nccl` resolves its version
 from whatever repo is configured, and `pip install torch --index-url
 .../cu130` picks the `manylinux_2_28_aarch64` wheel by itself.
+
+## Building a component for another Python version
+
+`build_matrix` rows carry a quoted `python` field (`"3.11"` / `"3.12"` -
+quoted so YAML doesn't parse it as a float), and each component chooses which
+interpreters it builds for with `python_versions`. It is the exact Python
+counterpart of `arches`:
+
+```yaml
+components:
+  flash-attention:
+    # no `python_versions` field -> every python version in build_matrix
+
+  megatron-bridge:
+    python_versions: ["3.12"]  # opt out of 3.11
+```
+
+The six CUDA-extension components (flash-attention, apex, TransformerEngine,
+deep-ep, flash-mla, fast-hadamard-transform) build for every version in the
+matrix because their wheels carry interpreter-specific `cp311`/`cp312` tags.
+`megatron-bridge` and `flashinfer` pin `["3.12"]`: their wheels are portable
+`py3-none-any`, so one wheel installs on every interpreter and a second build
+would only re-upload an identical asset, and Megatron-Bridge's upstream
+`requires-python` (">=3.12,<3.13") excludes 3.11 entirely.
+
+To add a Python version:
+
+1. Confirm prerequisites first: PyTorch publishes `cp<abi>` wheels for the
+   target CUDA index on **every arch the component builds for**
+   (`curl -sI https://download.pytorch.org/whl/cu130/...`), and the
+   component itself (and its build script) supports the interpreter.
+2. Append one `build_matrix` entry per arch, copying the existing
+   CUDA/Torch pins, with `python: "<version>"`.
+3. Add the version to the static `options:` list of the `python` dispatch
+   input in **every** `.github/workflows/build-*.yml`. GitHub Actions choice
+   lists cannot be generated dynamically, so they mirror `build_matrix` by
+   hand; `generate_matrix.py` rejects any value the matrix doesn't know.
+4. Pin `python_versions: [...]` on any component whose wheels are
+   `py3-none-any` or whose upstream `requires-python` excludes the new
+   version, so it doesn't re-upload an identical asset or fail outright.
+5. Regenerate the matrix and smoke-test one interpreter without touching the
+   others, locally or via the workflow's **python** dispatch input:
+
+   ```bash
+   python3 ci/generate_matrix.py --component <name> --python 3.11
+   python3 ci/generate_matrix.py --component all   # full matrix, e.g. 27 rows
+   ```
+
+   An empty result for an opted-out component (e.g.
+   `--component megatron-bridge --python 3.11`) is expected; the workflow
+   skips its build job via `has_builds`.
+
+Adding a Python version changes the release **title** of every component that
+builds for it (each interpreter is one `py<python>` segment), so the next
+push rebuilds that component for *all* its interpreters - the skip check
+requires an exact title match. Components whose `python_versions` excludes
+the new version keep their old title and are not disturbed, which is exactly
+why the pure-Python components pin it.
 
 ## Arch-list conventions
 

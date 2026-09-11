@@ -44,7 +44,10 @@ Checklist:
       comments already in that file. `wheel_packages` must list every
       distribution the build uploads; push builds use it to detect a complete
       matching release. Start with `arches: [x86_64]` and add arm64 later
-      (see below).
+      (see below). Leave `python_versions` unset to build for every
+      interpreter in the matrix (3.11 + 3.12); pin `python_versions: ["3.12"]`
+      only for `py3-none-any` wheels or upstream `requires-python >=3.12`
+      components (see "Python versions" below).
 - [ ] Create `ci/build_scripts/<builder>.sh`. Copy the shape of an existing
       script (`ci/build_scripts/apex.sh` is a good default): shebang,
       `set -euo pipefail`, source `common.sh`, call `export_extra_env`,
@@ -103,6 +106,39 @@ Each arch is a separate job. To build just one, dispatch
 `--arch <arch>` to `ci/generate_matrix.py` locally); pushes always build
 every arch. When adding a new arch to `build_matrix`, extend the static
 `options:` list of every workflow's `arch` dispatch input to match.
+
+## Python versions (3.11 / 3.12)
+
+`build_matrix` rows carry a quoted `python: "3.11"` / `"3.12"` field. A
+component builds every Python version in the matrix unless it narrows that
+with `python_versions: [...]`, the exact counterpart of `arches`. The six
+CUDA-extension components build both interpreters (their wheels carry
+`cp311`/`cp312` tags); `megatron-bridge` and `flashinfer` pin
+`python_versions: ["3.12"]` because their wheels are portable
+`py3-none-any` (a second build only re-uploads an identical asset) and
+Megatron-Bridge's upstream `requires-python` (">=3.12,<3.13") excludes 3.11.
+
+To add a Python version:
+
+- [ ] Verify torch publishes `cp<abi>` cu<cuda> wheels on **every arch** the
+      component builds (`curl -sI https://download.pytorch.org/whl/cu130/...`).
+- [ ] Append one quoted `python: "<v>"` row per arch to `build_matrix`.
+- [ ] Extend the static `options:` list of the `python` dispatch input in
+      **every** `.github/workflows/build-*.yml` (choice lists can't be
+      generated; `generate_matrix.py` rejects unknown versions).
+- [ ] Pin `python_versions: [...]` on any `py3-none-any` / `requires-python`
+      component so it doesn't rebuild or fail.
+- [ ] Validate:
+      `python3 ci/generate_matrix.py --component all` (expect 27 rows today),
+      `--component <name> --python <v>` for the smoke subset, and
+      `cd ci && python3 -m unittest test_generate_matrix`.
+
+To build just one interpreter, dispatch with the `python` input (or pass
+`--python <v>` locally); an opted-out component yields an empty matrix and
+its build job is skipped. Each interpreter adds a `py<python>` segment to
+the release title, so adding a version rebuilds opted-in components for all
+interpreters on the next push; pinned components keep their title and stay
+untouched.
 
 ## Arch-list conventions
 

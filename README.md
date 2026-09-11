@@ -80,16 +80,19 @@ the project's base directory - no Python, no workflow YAML - needs to
 change for routine version bumps:
 
 - **`build_matrix`**: the CPU arch / CUDA / Python / Torch combinations to
-  build. Seeded with CUDA `13.0.2`, Python `3.12`, Torch `2.11.0` (matching
-  both verl Dockerfiles' `ARG` defaults), on `x86_64` and `aarch64`. Add
-  another entry to build more combinations - every component is built once
-  per entry here, minus the ones its `arches` filter excludes.
+  build. Seeded with CUDA `13.0.2`, Python `3.11` and `3.12`, Torch `2.11.0`
+  (3.12 matches both verl Dockerfiles' `ARG` defaults; 3.11 is added because
+  torch publishes cp311 cu130 wheels for both arches and downstream envs
+  still run it), on `x86_64` and `aarch64`. Add another entry to build more
+  combinations - every component is built once per entry here, minus the ones
+  its `arches` / `python_versions` filters exclude.
 - **`components`**: per-submodule config - the git `ref` to build (branch,
   tag, or commit; overrides whatever commit the submodule pointer in this
   repo is on), which `ci/build_scripts/<builder>.sh` to run, the CUDA arch
   list, whether cuDNN is required, `max_jobs`, the runner label, which CPU
-  arches to build for (`arches`) with optional per-arch field overrides
-  (`arch_overrides`), and any extra environment variables.
+  arches to build for (`arches`) and which Python versions (`python_versions`)
+  with optional per-arch field overrides (`arch_overrides`), and any extra
+  environment variables.
 - **`verl_reference_versions`**: versions verl's Dockerfiles pin for things
   this repo does *not* build (`transformers`, `trl`, `nsight_systems`,
   `megatron`, `verl` itself) - tracked here purely for compatibility
@@ -126,7 +129,9 @@ for a component and its currently-pinned `ref` in `versions.yaml`:
 - **title**: `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]`
   (one segment per `build_matrix` entry the component is built for, with the
   `x86_64` arch left implicit), e.g. `transformer-engine v2.16.1 - cu13.0.2
-  py3.12 torch2.11.0` or `flash-attention v2.8.3 - cu13.0.2 py3.12
+  py3.11 torch2.11.0; cu13.0.2 py3.12 torch2.11.0` or, once a component builds
+  both interpreters on both arches, `flash-attention v2.8.3 - cu13.0.2 py3.11
+  torch2.11.0; cu13.0.2 py3.12 torch2.11.0; aarch64 cu13.0.2 py3.11
   torch2.11.0; aarch64 cu13.0.2 py3.12 torch2.11.0`
 
 The reusable `.github/workflows/_ensure_release.yml` workflow creates that
@@ -147,10 +152,12 @@ historical record.
 - Every arch/CUDA/Python/Torch combination is an independent job on its own
   runner, with its own build cache and wheel artifact, and `fail-fast: false`
   keeps one failure from cancelling the others. A manual run additionally
-  takes an **arch** choice (`all` / `x86_64` / `aarch64`), so you can test one
-  architecture without spending hours of runner time on the others; a
-  component that doesn't opt into the chosen arch simply has nothing to build
-  and its build job is skipped. Pushes always build every arch.
+  takes an **arch** choice (`all` / `x86_64` / `aarch64`) and a **python**
+  choice (`all` / `3.11` / `3.12`), so you can test one architecture or
+  interpreter without spending hours of runner time on the others; a
+  component that doesn't opt into the chosen arch/python version simply has
+  nothing to build and its build job is skipped. Pushes always build every
+  combination the component opts into.
 - On a push, the workflow first checks the component's target release. If its
   title exactly matches the configured arch/CUDA/Python/Torch matrix and it
   contains every distribution listed in that component's `wheel_packages` for
@@ -215,6 +222,18 @@ in from `${{ github.repository }}`, so no other change is needed.
   release. `flashinfer` is a hybrid for the same reason - two of its three
   wheels are `py3-none-any`, so `flashinfer.sh` emits those on x86_64 only and
   the arm64 job contributes just the arch-specific `flashinfer-jit-cache`.
+- **The six CUDA-extension components build for both Python 3.11 and 3.12;
+  `Megatron-Bridge` and `flashinfer` pin `python_versions: ["3.12"]`.** A
+  `cp311`/`cp312` wheel is interpreter-specific, so flash-attention, apex,
+  TransformerEngine, deep-ep, flash-mla and fast-hadamard-transform ship one
+  wheel per interpreter per arch. The pure-Python components opt out of 3.11:
+  their `py3-none-any` wheel already installs on every interpreter, so a
+  second build would only re-upload an identical asset, and Megatron-Bridge
+  additionally cannot build on 3.11 at all (upstream declares
+  `requires-python >=3.12`). Adding a Python version is a two-step change:
+  append its entries to `build_matrix` *and* add that version to the static
+  `options:` list of every workflow's `python` dispatch input (GitHub Actions
+  choice lists cannot be generated dynamically).
 - **arm64 always builds on GitHub-hosted runners.** The self-hosted machine is
   x86_64-only, so every `arch_overrides.aarch64` points at `ubuntu-24.04-arm`
   (GitHub's free 4 vCPU / 16 GB arm64 runner) rather than waiting on arm

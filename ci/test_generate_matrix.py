@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
+import contextlib
+import io
 import json
 import re
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -388,6 +391,144 @@ class DryRunReportTests(unittest.TestCase):
         self.assertTrue(all(d["decision"] == "build" for d in decisions))
         self.assertEqual(2, len(decisions))
         inspect_release.assert_called()
+
+
+def make_python_matrix_versions(component_cfg, arches=("x86_64", "aarch64"),
+                                pythons=("3.11", "3.12")):
+    """A 2 arch x 2 python build_matrix, ordered exactly like versions.yaml
+    (x86_64 rows before aarch64, and 3.11 before 3.12 within each arch)."""
+    return {
+        "build_matrix": [
+            {
+                "arch": arch,
+                "cuda": "13.0.2",
+                "python": python,
+                "torch": "2.11.0",
+                "torch_vision": "0.26.0",
+                "torch_audio": "2.11.0",
+                "cxx11_abi": "TRUE",
+            }
+            for arch in arches
+            for python in pythons
+        ],
+        "components": {"demo": component_cfg},
+    }
+
+
+class PythonVersionFilterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cfg = {
+            "ref": "v1.2.3",
+            "path": "demo",
+            "builder": "demo",
+            "wheel_packages": ["demo"],
+            "torch_cuda_arch_list": "8.0;9.0;10.0",
+            "max_jobs": 4,
+            # A GitHub-hosted (not self-hosted) label so the 2-arch fixture
+            # passes check_runner_policy for its aarch64 rows.
+            "runs_on": ["ubuntu-24.04"],
+        }
+        self.versions = make_python_matrix_versions(dict(self.cfg))
+
+    def test_matrix_python_versions_follow_first_seen_order(self) -> None:
+        self.assertEqual(
+            ["3.11", "3.12"],
+            generate_matrix.matrix_python_versions(self.versions),
+        )
+
+    def test_component_without_python_versions_builds_every_python(self) -> None:
+        self.assertEqual(
+            ["3.11", "3.12"],
+            generate_matrix.component_python_versions(self.versions, "demo"),
+        )
+        combos = generate_matrix.component_combos(self.versions, "demo")
+        self.assertEqual(
+            [
+                ("x86_64", "3.11"),
+                ("x86_64", "3.12"),
+                ("aarch64", "3.11"),
+                ("aarch64", "3.12"),
+            ],
+            [
+                (generate_matrix.combo_arch(c), generate_matrix.combo_python(c))
+                for c in combos
+            ],
+        )
+
+    def test_python_versions_subset_like_py3_none_any_component(self) -> None:
+        # megatron-bridge/flashinfer pin python_versions: ["3.12"] so the same
+        # py3-none-any asset is not uploaded once per interpreter.
+        self.versions["components"]["demo"]["python_versions"] = ["3.12"]
+        self.assertEqual(
+            ["3.12"],
+            generate_matrix.component_python_versions(self.versions, "demo"),
+        )
+        combos = generate_matrix.component_combos(self.versions, "demo")
+        self.assertEqual(
+            [("x86_64", "3.12"), ("aarch64", "3.12")],
+            [
+                (generate_matrix.combo_arch(c), generate_matrix.combo_python(c))
+                for c in combos
+            ],
+        )
+
+    def test_python_filter_combines_with_arch_filter(self) -> None:
+        cfg = dict(self.cfg, arches=["aarch64"], python_versions=["3.11"])
+        self.versions["components"]["demo"] = cfg
+        combos = generate_matrix.component_combos(self.versions, "demo")
+        self.assertEqual(
+            [("aarch64", "3.11")],
+            [
+                (generate_matrix.combo_arch(c), generate_matrix.combo_python(c))
+                for c in combos
+            ],
+        )
+
+    def test_unknown_python_version_is_rejected(self) -> None:
+        self.versions["components"]["demo"]["python_versions"] = ["2.7"]
+        with self.assertRaises(SystemExit) as ctx:
+            generate_matrix.component_python_versions(self.versions, "demo")
+        self.assertIn("not in build_matrix", str(ctx.exception))
+        self.assertIn("2.7", str(ctx.exception))
+
+    def _run_cli(self, argv):
+        out = io.StringIO()
+        with patch.object(sys, "argv", ["generate_matrix.py"] + argv), patch(
+            "generate_matrix.load_versions", return_value=self.versions
+        ), contextlib.redirect_stdout(out):
+            generate_matrix.main()
+        return json.loads(out.getvalue())
+
+    def test_cli_python_filter_keeps_only_requested_interpreter(self) -> None:
+        rows = self._run_cli(["--component", "demo", "--python", "3.11"])
+        self.assertEqual(2, len(rows))
+        self.assertTrue(all(row["python"] == "3.11" for row in rows))
+        self.assertEqual({"x86_64", "aarch64"}, {row["arch"] for row in rows})
+
+    def test_cli_python_all_default_builds_every_interpreter(self) -> None:
+        rows = self._run_cli(["--component", "demo"])
+        self.assertEqual(4, len(rows))
+        # build_matrix order is preserved verbatim (arch outer, python inner).
+        self.assertEqual(
+            [
+                ("x86_64", "3.11"),
+                ("x86_64", "3.12"),
+                ("aarch64", "3.11"),
+                ("aarch64", "3.12"),
+            ],
+            [(r["arch"], r["python"]) for r in rows],
+        )
+
+    def test_cli_python_filter_can_leave_an_empty_matrix(self) -> None:
+        # A 3.12-only component dispatched with --python 3.11 yields no rows;
+        # has_builds lets the workflow skip rather than fail on an empty matrix.
+        self.versions["components"]["demo"]["python_versions"] = ["3.12"]
+        self.assertEqual([], self._run_cli(["--component", "demo", "--python", "3.11"]))
+
+    def test_cli_unknown_python_exits_2(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            self._run_cli(["--component", "demo", "--python", "2.7"])
+        self.assertEqual(2, ctx.exception.code)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ Usage:
     python ci/generate_matrix.py --component apex
     python ci/generate_matrix.py --component all
     python ci/generate_matrix.py --component flash-attention --arch aarch64
+    python ci/generate_matrix.py --component deep-ep --python 3.11
     python ci/generate_matrix.py --list-components
     python ci/generate_matrix.py --component apex --github-output
 """
@@ -109,9 +110,20 @@ def combo_arch(combo: Dict[str, Any]) -> str:
     return str(combo.get("arch", DEFAULT_ARCH))
 
 
+def combo_python(combo: Dict[str, Any]) -> str:
+    return str(combo["python"])
+
+
 def matrix_arches(versions: Dict[str, Any]) -> List[str]:
     """Every arch the build_matrix covers, in first-seen order."""
     return list(dict.fromkeys(combo_arch(combo) for combo in versions["build_matrix"]))
+
+
+def matrix_python_versions(versions: Dict[str, Any]) -> List[str]:
+    """Every Python version the build_matrix covers, in first-seen order."""
+    return list(
+        dict.fromkeys(combo_python(combo) for combo in versions["build_matrix"])
+    )
 
 
 def component_arches(versions: Dict[str, Any], component: str) -> List[str]:
@@ -144,10 +156,40 @@ def component_arches(versions: Dict[str, Any], component: str) -> List[str]:
     return [arch for arch in available if arch in {str(a) for a in configured}]
 
 
+def component_python_versions(versions: Dict[str, Any], component: str) -> List[str]:
+    """The Python versions one component opts into, in build_matrix order.
+
+    Mirrors component_arches: no `python_versions` field builds for every
+    Python version in the matrix; an explicit subset lets a component whose
+    wheels are py3-none-any (megatron-bridge, flashinfer) build once instead
+    of re-uploading the same asset from every interpreter row, and lets one
+    stay on 3.12 when upstream's requires-python excludes 3.11.
+    """
+    cfg = get_component(versions, component)
+    available = matrix_python_versions(versions)
+
+    configured = cfg.get("python_versions")
+    if configured is None:
+        return available
+
+    unknown = sorted({str(v) for v in configured} - set(available))
+    if unknown:
+        raise SystemExit(
+            f"Component {component!r} lists Python version(s) not in build_matrix: "
+            f"{', '.join(unknown)}. Known versions: {', '.join(available)}"
+        )
+    return [v for v in available if v in {str(p) for p in configured}]
+
+
 def component_combos(versions: Dict[str, Any], component: str) -> List[Dict[str, Any]]:
     """The build_matrix rows one component is actually built for."""
     arches = set(component_arches(versions, component))
-    return [combo for combo in versions["build_matrix"] if combo_arch(combo) in arches]
+    pythons = set(component_python_versions(versions, component))
+    return [
+        combo
+        for combo in versions["build_matrix"]
+        if combo_arch(combo) in arches and combo_python(combo) in pythons
+    ]
 
 
 def check_runner_policy(component: str, arch: str, runs_on: Any) -> None:
@@ -940,6 +982,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--python",
+        default="all",
+        help=(
+            "Restrict the matrix to one build_matrix Python version (e.g. 3.11), or "
+            "'all' (default) for every version each component opts into. Useful to "
+            "test a new interpreter without also rebuilding the others."
+        ),
+    )
+    parser.add_argument(
         "--list-components",
         action="store_true",
         help="Print known component names (one per line) and exit.",
@@ -1007,6 +1058,18 @@ def main() -> None:
         # has_builds output below lets the calling workflow skip its build job
         # rather than fail on an empty matrix.
         matrix = [entry for entry in matrix if entry["arch"] == args.arch]
+
+    if args.python != "all":
+        available = matrix_python_versions(versions)
+        if args.python not in available:
+            parser.error(
+                f"Unknown Python version {args.python!r}. Known versions: "
+                f"{', '.join(available)}, all"
+            )
+        # As with the arch filter, an empty result is fine (e.g.
+        # --component megatron-bridge --python 3.11): that component opts out
+        # of this interpreter, and has_builds skips its build job.
+        matrix = [entry for entry in matrix if entry["python"] == args.python]
 
     if args.report:
         if not args.repo:
