@@ -243,6 +243,12 @@ components:
     runs_on: [self-hosted, Linux, X64]
     # No `arches` filter: built for every arch in build_matrix.
     arch_overrides:
+      x86_64:
+        # _build.yml gives each self-hosted proxy upload a 2h ceiling (artifact
+        # + release) and the build itself may use its full 5h budget, so the
+        # default 360m job cap could kill a slow-but-progressing run. Self-hosted
+        # runners are not bound to GitHub-hosted runners' 360m maximum.
+        job_timeout_minutes: 600
       aarch64:
         runs_on: ubuntu-24.04-arm
         # Effective nvcc concurrency is max_jobs x NVTE_BUILD_THREADS_PER_JOB,
