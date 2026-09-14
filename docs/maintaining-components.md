@@ -12,12 +12,12 @@ other logic needs to change for routine work.
 |---|---|
 | `versions.yaml` | The version map: arch/CUDA/Python/Torch build matrix + per-component config |
 | `ci/generate_matrix.py` | Expands `versions.yaml` into the GitHub Actions matrix (no edits needed for routine work) |
-| `ci/release_meta.py` | Computes each component's release tag/title/notes (no edits needed for routine work) |
+| `ci/release_meta.py` | Computes each (component, Python) release's tag/title/notes (no edits needed for routine work) |
 | `ci/build_scripts/common.sh` | Shared bash helpers (no edits needed unless adding new shared logic) |
 | `ci/build_scripts/<builder>.sh` | The actual wheel-build command for one component |
 | `.github/workflows/build-<component>.yml` | Per-component trigger workflow |
 | `.github/workflows/_build.yml` | Reusable build workflow (no edits needed) |
-| `.github/workflows/_ensure_release.yml` | Reusable create/update-release workflow (no edits needed) |
+| `.github/workflows/_ensure_release.yml` | Legacy helper for 3.12 bare-tag releases only; release creation now runs inline in `_build.yml` (no edits needed) |
 | `.github/workflows/build-all.yml`, `release.yml` | Already build every component via `--component all` (no edits needed) |
 
 ## Upgrading an existing component's version
@@ -52,18 +52,20 @@ other logic needs to change for routine work.
    wheels' `.nv_fatbin` sections actually cover every SM arch
    `torch_cuda_arch_list` promises. Anything unverifiable (download failure,
    no manifest, old schema) fails closed and rebuilds. Otherwise, on
-   success, that push creates (or reuses) the component's own persistent
-   release - tag
-   `<component>-<new-ref>`, title `<component> <new-ref> - cu.. py..
-   torch..` (see `ci/release_meta.py`) - uploads the new wheel there, and
-   republishes the package index, so it's `pip install`-able right away.
-   Bumping `ref` therefore starts a brand-new release; the previous ref's
-   release is left untouched as history. You can also trigger the workflow
+   success, that push creates (or reuses) that component's per-Python
+   releases - tag `<component>-<new-ref>` for the legacy 3.12 interpreter
+   and `<component>-<new-ref>-pyX.Y` for every other interpreter, each
+   titled `<component> <new-ref> - cu.. pyX.Y torch..` listing only that
+   interpreter's combos (see `ci/release_meta.py`) - uploads each new wheel
+   to its matching release, and republishes the package index, so it's
+   `pip install`-able right away. Bumping `ref` therefore starts brand-new
+   releases; the previous ref's releases are left untouched as history. You
+   can also trigger the workflow
    manually from the Actions tab (`workflow_dispatch`) to test before
    merging (manual runs build but skip publishing).
 6. Once you're happy, push a tag matching `v*` (`git tag vX.Y.Z && git push
    --tags`) to run `release.yml`: a full sweep that rebuilds every
-   component and re-ensures/uploads to each one's own release, same as
+   component and uploads to each (component, Python) release, same as
    step 5 but across the whole matrix at once. The pushed tag is only a
    trigger - it does not itself become a release.
 
@@ -137,13 +139,15 @@ Worked checklist, using a hypothetical `xformers` component as the example:
      `.github/workflows/build-xformers.yml`
    - the `--component flashinfer` argument in the `compute-matrix` job →
      `--component xformers`
-   - the `component: flashinfer` input under the `ensure-release` job → `component: xformers`
 
-   Everything else - `workflow_dispatch`, the reusable `_ensure_release.yml`
-   call's structure, and the trailing `publish-index` job that runs after a
-   successful push build - is component-agnostic and can be copied as-is.
-   `ci/release_meta.py` will automatically compute `xformers`'s own release
-   tag/title once its `components:` entry exists in `versions.yaml`.
+   There is no per-workflow release job: on push builds `_build.yml` creates
+   the release inline, keyed by the matrix row's `release_tag`. Everything
+   else - `workflow_dispatch`, the reusable `_build.yml` call's structure,
+   and the trailing `publish-index` job that runs after a successful push
+   build - is component-agnostic and can be copied as-is. `ci/release_meta.py`
+   automatically computes `xformers`'s per-Python release tags/titles (bare
+   `<component>-<ref>` for 3.12, `<component>-<ref>-pyX.Y` otherwise) once
+   its `components:` entry exists in `versions.yaml`.
 
    If your new component's `runs_on` is **self-hosted**, copy
    `.github/workflows/build-apex.yml` instead: it additionally forwards a
@@ -217,8 +221,11 @@ To turn arm64 on for a component:
 
    ```bash
    python3 ci/generate_matrix.py --component <name> | python3 -m json.tool
-   python3 ci/release_meta.py --component <name>
+   python3 ci/release_meta.py --component <name> --python all
    ```
+
+   (`--python all` prints every per-interpreter release; omit it to
+   self-select the locally running interpreter.)
 
 6. Smoke-test the new arch on its own before letting a push build both:
    trigger `build-<component>.yml` from the Actions tab and set its **arch**
@@ -230,11 +237,12 @@ To turn arm64 on for a component:
    python3 ci/generate_matrix.py --component <name> --arch aarch64
    ```
 
-Adding an arch to a component changes its release title, which is what makes
-the next push rebuild it (the skip check requires an exact title match *and*
-a wheel per package per arch, matched on each wheel's platform tag). Titles
-leave `x86_64` implicit, so x86_64-only components keep their existing titles
-and are not disturbed when a new arch enters `build_matrix`.
+Adding an arch to a component changes each of its per-interpreter release
+titles, which is what makes the next push rebuild those releases (the skip
+check requires an exact title match *and* a wheel per package per arch,
+matched on each wheel's platform tag). Titles leave `x86_64` implicit, so
+x86_64-only components keep their existing titles and are not disturbed when
+a new arch enters `build_matrix`.
 
 The rest of the toolchain is already arch-agnostic: `Jimver/cuda-toolkit`
 switches its apt repo to NVIDIA's `sbsa` path on arm64, `common.sh`'s
@@ -293,12 +301,17 @@ To add a Python version:
    `--component megatron-bridge --python 3.11`) is expected; the workflow
    skips its build job via `has_builds`.
 
-Adding a Python version changes the release **title** of every component that
-builds for it (each interpreter is one `py<python>` segment), so the next
-push rebuilds that component for *all* its interpreters - the skip check
-requires an exact title match. Components whose `python_versions` excludes
-the new version keep their old title and are not disturbed, which is exactly
-why the pure-Python components pin it.
+Each interpreter gets its **own release**: the interpreter the wheelhouse
+shipped before the split (3.12) keeps the bare `<component>-<ref>` tag, and
+every other interpreter gets `<component>-<ref>-pyX.Y` (see
+`LEGACY_RELEASE_PYTHON` in `ci/generate_matrix.py`); the title lists only
+that interpreter's combos. Adding a Python version therefore never edits
+the existing releases - their tag, title and manifest stay byte-identical
+and their rows keep skipping - while the new interpreter's rows build into
+new `-pyX.Y` releases. Components whose `python_versions` excludes the new
+version are not disturbed either, which is exactly why the pure-Python
+components pin it (they must not upload the same `py3-none-any` asset to
+two releases).
 
 ## Arch-list conventions
 
