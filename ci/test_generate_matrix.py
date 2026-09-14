@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
+import contextlib
+import io
 import json
 import re
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import generate_matrix
+import release_meta
 from test_cuda_archs import fatbin_elf, make_wheel
 
 
@@ -26,14 +30,19 @@ def make_versions(component):
     }
 
 
-def make_release(versions, assets):
+def make_release(versions, assets, python="3.12"):
     """A release dict whose title/notes are computed the way release_meta.py
-    computes them, so the hidden body manifest matches versions.yaml exactly."""
+    computes them for one (component, Python) release, so the hidden body
+    manifest matches versions.yaml exactly."""
     cfg = versions["components"]["demo"]
     ref = str(cfg["ref"])
     return {
-        "name": generate_matrix.release_title(ref, "demo", generate_matrix.component_combos(versions, "demo")),
-        "body": generate_matrix.format_release_notes(versions, "demo"),
+        "name": generate_matrix.release_title(
+            ref,
+            "demo",
+            generate_matrix.component_combos_for_python(versions, "demo", python),
+        ),
+        "body": generate_matrix.format_release_notes(versions, "demo", python),
         "assets": [{"name": name, "size": size} for name, size in assets],
     }
 
@@ -66,14 +75,14 @@ class ExistingReleaseTests(unittest.TestCase):
 
     def test_exact_release_covers_component(self) -> None:
         covered, _ = generate_matrix.release_covers_component(
-            self.versions, "demo", self.release
+            self.versions, "demo", "3.12", self.release
         )
         self.assertTrue(covered)
 
     def test_dependency_title_must_match_exactly(self) -> None:
         self.release["name"] = "demo v1.2.3 - cu12.8.1 py3.12 torch2.11.0"
         covered, reason = generate_matrix.release_covers_component(
-            self.versions, "demo", self.release
+            self.versions, "demo", "3.12", self.release
         )
         self.assertFalse(covered)
         self.assertIn("title mismatch", reason)
@@ -81,7 +90,7 @@ class ExistingReleaseTests(unittest.TestCase):
     def test_every_expected_wheel_package_is_required(self) -> None:
         self.release["assets"].pop()
         covered, reason = generate_matrix.release_covers_component(
-            self.versions, "demo", self.release
+            self.versions, "demo", "3.12", self.release
         )
         self.assertFalse(covered)
         self.assertIn("demo-helper", reason)
@@ -89,7 +98,7 @@ class ExistingReleaseTests(unittest.TestCase):
     def test_missing_manifest_forces_rebuild(self) -> None:
         self.release["body"] = "human notes only, no snapshot"
         covered, reason = generate_matrix.release_covers_component(
-            self.versions, "demo", self.release
+            self.versions, "demo", "3.12", self.release
         )
         self.assertFalse(covered)
         self.assertIn("no stored build config", reason)
@@ -255,7 +264,7 @@ class BuildConfigManifestTests(unittest.TestCase):
         # snapshot at all: the asset must be downloaded and used.
         release, wheel_name, fake_download = self._release_with_wheel(["8.0", "9.0", "10.0"])
         manifest_blob = json.dumps(
-            generate_matrix.component_build_manifest(self.versions, "demo"),
+            generate_matrix.component_build_manifest(self.versions, "demo", "3.12"),
             indent=2,
             sort_keys=True,
         )
@@ -388,6 +397,296 @@ class DryRunReportTests(unittest.TestCase):
         self.assertTrue(all(d["decision"] == "build" for d in decisions))
         self.assertEqual(2, len(decisions))
         inspect_release.assert_called()
+
+
+def make_python_matrix_versions(component_cfg, arches=("x86_64", "aarch64"),
+                                pythons=("3.11", "3.12")):
+    """A 2 arch x 2 python build_matrix, ordered exactly like versions.yaml
+    (x86_64 rows before aarch64, and 3.11 before 3.12 within each arch)."""
+    return {
+        "build_matrix": [
+            {
+                "arch": arch,
+                "cuda": "13.0.2",
+                "python": python,
+                "torch": "2.11.0",
+                "torch_vision": "0.26.0",
+                "torch_audio": "2.11.0",
+                "cxx11_abi": "TRUE",
+            }
+            for arch in arches
+            for python in pythons
+        ],
+        "components": {"demo": component_cfg},
+    }
+
+
+class PythonVersionFilterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cfg = {
+            "ref": "v1.2.3",
+            "path": "demo",
+            "builder": "demo",
+            "wheel_packages": ["demo"],
+            "torch_cuda_arch_list": "8.0;9.0;10.0",
+            "max_jobs": 4,
+            # A GitHub-hosted (not self-hosted) label so the 2-arch fixture
+            # passes check_runner_policy for its aarch64 rows.
+            "runs_on": ["ubuntu-24.04"],
+        }
+        self.versions = make_python_matrix_versions(dict(self.cfg))
+
+    def test_matrix_python_versions_follow_first_seen_order(self) -> None:
+        self.assertEqual(
+            ["3.11", "3.12"],
+            generate_matrix.matrix_python_versions(self.versions),
+        )
+
+    def test_component_without_python_versions_builds_every_python(self) -> None:
+        self.assertEqual(
+            ["3.11", "3.12"],
+            generate_matrix.component_python_versions(self.versions, "demo"),
+        )
+        combos = generate_matrix.component_combos(self.versions, "demo")
+        self.assertEqual(
+            [
+                ("x86_64", "3.11"),
+                ("x86_64", "3.12"),
+                ("aarch64", "3.11"),
+                ("aarch64", "3.12"),
+            ],
+            [
+                (generate_matrix.combo_arch(c), generate_matrix.combo_python(c))
+                for c in combos
+            ],
+        )
+
+    def test_python_versions_subset_like_py3_none_any_component(self) -> None:
+        # megatron-bridge/flashinfer pin python_versions: ["3.12"] so the same
+        # py3-none-any asset is not uploaded once per interpreter.
+        self.versions["components"]["demo"]["python_versions"] = ["3.12"]
+        self.assertEqual(
+            ["3.12"],
+            generate_matrix.component_python_versions(self.versions, "demo"),
+        )
+        combos = generate_matrix.component_combos(self.versions, "demo")
+        self.assertEqual(
+            [("x86_64", "3.12"), ("aarch64", "3.12")],
+            [
+                (generate_matrix.combo_arch(c), generate_matrix.combo_python(c))
+                for c in combos
+            ],
+        )
+
+    def test_python_filter_combines_with_arch_filter(self) -> None:
+        cfg = dict(self.cfg, arches=["aarch64"], python_versions=["3.11"])
+        self.versions["components"]["demo"] = cfg
+        combos = generate_matrix.component_combos(self.versions, "demo")
+        self.assertEqual(
+            [("aarch64", "3.11")],
+            [
+                (generate_matrix.combo_arch(c), generate_matrix.combo_python(c))
+                for c in combos
+            ],
+        )
+
+    def test_unknown_python_version_is_rejected(self) -> None:
+        self.versions["components"]["demo"]["python_versions"] = ["2.7"]
+        with self.assertRaises(SystemExit) as ctx:
+            generate_matrix.component_python_versions(self.versions, "demo")
+        self.assertIn("not in build_matrix", str(ctx.exception))
+        self.assertIn("2.7", str(ctx.exception))
+
+    def _run_cli(self, argv):
+        out = io.StringIO()
+        with patch.object(sys, "argv", ["generate_matrix.py"] + argv), patch(
+            "generate_matrix.load_versions", return_value=self.versions
+        ), contextlib.redirect_stdout(out):
+            generate_matrix.main()
+        return json.loads(out.getvalue())
+
+    def test_cli_python_filter_keeps_only_requested_interpreter(self) -> None:
+        rows = self._run_cli(["--component", "demo", "--python", "3.11"])
+        self.assertEqual(2, len(rows))
+        self.assertTrue(all(row["python"] == "3.11" for row in rows))
+        self.assertEqual({"x86_64", "aarch64"}, {row["arch"] for row in rows})
+
+    def test_cli_python_all_default_builds_every_interpreter(self) -> None:
+        rows = self._run_cli(["--component", "demo"])
+        self.assertEqual(4, len(rows))
+        # build_matrix order is preserved verbatim (arch outer, python inner).
+        self.assertEqual(
+            [
+                ("x86_64", "3.11"),
+                ("x86_64", "3.12"),
+                ("aarch64", "3.11"),
+                ("aarch64", "3.12"),
+            ],
+            [(r["arch"], r["python"]) for r in rows],
+        )
+
+    def test_cli_python_filter_can_leave_an_empty_matrix(self) -> None:
+        # A 3.12-only component dispatched with --python 3.11 yields no rows;
+        # has_builds lets the workflow skip rather than fail on an empty matrix.
+        self.versions["components"]["demo"]["python_versions"] = ["3.12"]
+        self.assertEqual([], self._run_cli(["--component", "demo", "--python", "3.11"]))
+
+    def test_cli_unknown_python_exits_2(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            self._run_cli(["--component", "demo", "--python", "2.7"])
+        self.assertEqual(2, ctx.exception.code)
+
+
+class PerPythonReleaseTests(unittest.TestCase):
+    """One GitHub Release per (component, Python version): the legacy 3.12
+    release keeps its bare tag/title, while 3.11 gets separate new releases."""
+
+    PY312_WHEELS = [
+        ("demo-1.2.3-cp312-cp312-manylinux_2_28_x86_64.whl", 1000),
+        ("demo-1.2.3-cp312-cp312-manylinux_2_28_aarch64.whl", 1000),
+    ]
+    PY311_WHEELS = [
+        ("demo-1.2.3-cp311-cp311-manylinux_2_28_x86_64.whl", 1000),
+        ("demo-1.2.3-cp311-cp311-manylinux_2_28_aarch64.whl", 1000),
+    ]
+
+    def setUp(self) -> None:
+        self._fp_patch = patch(
+            "generate_matrix.build_input_fingerprint", return_value=STUB_FINGERPRINT
+        )
+        self._cuobjdump_patch = patch("cuda_archs.find_cuobjdump", return_value=None)
+        self._fp_patch.start()
+        self._cuobjdump_patch.start()
+        self.addCleanup(self._fp_patch.stop)
+        self.addCleanup(self._cuobjdump_patch.stop)
+
+        self.cfg = {
+            "ref": "v1.2.3",
+            "path": "demo",
+            "builder": "demo",
+            "wheel_packages": ["demo"],
+            "torch_cuda_arch_list": "8.0;9.0;10.0",
+            "max_jobs": 4,
+            "runs_on": ["ubuntu-24.04"],
+        }
+        self.versions = make_python_matrix_versions(dict(self.cfg))
+        self.entries = generate_matrix.build_full_matrix(self.versions, ["demo"])
+
+    def test_legacy_python_keeps_bare_tag(self) -> None:
+        tags = {(r["arch"], r["python"]): r["release_tag"] for r in self.entries}
+        self.assertEqual("demo-v1.2.3", tags[("x86_64", "3.12")])
+        self.assertEqual("demo-v1.2.3", tags[("aarch64", "3.12")])
+        self.assertEqual("demo-v1.2.3-py3.11", tags[("x86_64", "3.11")])
+        self.assertEqual("demo-v1.2.3-py3.11", tags[("aarch64", "3.11")])
+
+    def test_release_title_lists_only_that_python_segments(self) -> None:
+        title312 = generate_matrix.release_title(
+            "v1.2.3",
+            "demo",
+            generate_matrix.component_combos_for_python(self.versions, "demo", "3.12"),
+        )
+        self.assertEqual(
+            "demo v1.2.3 - cu13.0.2 py3.12 torch2.11.0; "
+            "aarch64 cu13.0.2 py3.12 torch2.11.0",
+            title312,
+        )
+        title311 = generate_matrix.release_title(
+            "v1.2.3",
+            "demo",
+            generate_matrix.component_combos_for_python(self.versions, "demo", "3.11"),
+        )
+        self.assertEqual(
+            "demo v1.2.3 - cu13.0.2 py3.11 torch2.11.0; "
+            "aarch64 cu13.0.2 py3.11 torch2.11.0",
+            title311,
+        )
+
+    def test_manifest_is_scoped_to_one_python(self) -> None:
+        for python in ("3.11", "3.12"):
+            manifest = generate_matrix.component_build_manifest(
+                self.versions, "demo", python
+            )
+            self.assertEqual(python, manifest["python"])
+            self.assertEqual(2, len(manifest["builds"]))
+            self.assertEqual({python}, {build["python"] for build in manifest["builds"]})
+
+    @patch("generate_matrix.inspect_release")
+    def test_existing_py312_release_skips_while_new_py311_release_builds(
+        self, inspect_release
+    ) -> None:
+        release312 = make_release(self.versions, self.PY312_WHEELS, python="3.12")
+        seen_tags = []
+
+        def fake_inspect(_repo, tag):
+            seen_tags.append(tag)
+            return release312 if tag == "demo-v1.2.3" else None
+
+        inspect_release.side_effect = fake_inspect
+        decisions = generate_matrix.evaluate_matrix_rows(
+            self.versions, self.entries, "owner/repo", verify_wheels=False
+        )
+        by = {(d["entry"]["arch"], d["entry"]["python"]): d for d in decisions}
+        for arch in ("x86_64", "aarch64"):
+            self.assertEqual("skip", by[(arch, "3.12")]["decision"])
+            self.assertIn("exact title", by[(arch, "3.12")]["reason"])
+            self.assertEqual("build", by[(arch, "3.11")]["decision"])
+            self.assertIn("would be created", by[(arch, "3.11")]["reason"])
+        # Each per-python release is inspected once, shared by both arch rows.
+        self.assertEqual(2, inspect_release.call_count)
+        self.assertEqual(
+            ["demo-v1.2.3", "demo-v1.2.3-py3.11"], sorted(seen_tags)
+        )
+
+    def test_one_python_release_never_covers_the_other_python_row(self) -> None:
+        release311 = make_release(self.versions, self.PY311_WHEELS, python="3.11")
+        combo312 = generate_matrix.component_combos_for_python(
+            self.versions, "demo", "3.12"
+        )[0]
+        covered, reason = generate_matrix.release_covers_combo(
+            self.versions, "demo", combo312, release311, repo=None, verify_wheels=False
+        )
+        self.assertFalse(covered)
+        self.assertIn("title mismatch", reason)
+
+    def test_release_meta_explicit_python(self) -> None:
+        meta = release_meta.component_release_meta(self.versions, "demo", "3.11")
+        self.assertEqual("demo-v1.2.3-py3.11", meta["tag"])
+        self.assertEqual("3.11", meta["python"])
+        self.assertIn("py3.11", meta["title"])
+        self.assertEqual(2, len(meta["manifest"]["builds"]))
+
+    def test_release_meta_all_emits_one_record_per_opted_in_python(self) -> None:
+        entries = release_meta.release_meta_entries(self.versions, ["demo"], "all")
+        self.assertEqual(
+            ["demo-v1.2.3-py3.11", "demo-v1.2.3"],
+            [entry["tag"] for entry in entries],
+        )
+
+    def test_release_meta_skips_components_not_opting_into_python(self) -> None:
+        # A 3.12-only py3-none-any component (megatron-bridge/flashinfer style)
+        # must not produce an empty 3.11 release when metadata is requested
+        # for every component.
+        self.versions["components"]["bridge"] = dict(
+            self.cfg, ref="v9.9.9", python_versions=["3.12"]
+        )
+        entries311 = release_meta.release_meta_entries(
+            self.versions, ["demo", "bridge"], "3.11"
+        )
+        self.assertEqual(
+            ["demo-v1.2.3-py3.11"], [entry["tag"] for entry in entries311]
+        )
+        entries_all = release_meta.release_meta_entries(
+            self.versions, ["demo", "bridge"], "all"
+        )
+        self.assertEqual(
+            ["demo-v1.2.3-py3.11", "demo-v1.2.3", "bridge-v9.9.9"],
+            [entry["tag"] for entry in entries_all],
+        )
+
+    def test_release_meta_rejects_python_component_does_not_build(self) -> None:
+        self.versions["components"]["demo"]["python_versions"] = ["3.12"]
+        with self.assertRaises(SystemExit):
+            release_meta.component_release_meta(self.versions, "demo", "3.11")
 
 
 if __name__ == "__main__":

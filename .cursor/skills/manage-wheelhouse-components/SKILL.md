@@ -24,11 +24,13 @@ This file has the quick-reference version.
 3. Validate: `pip install pyyaml && python3 ci/generate_matrix.py --component <name>`.
 4. Commit. Pushing to `main` auto-triggers `build-<component>.yml` (its
    `paths:` filter matches `versions.yaml`), and a successful build from a
-   push also creates that component's new persistent release - tag
-   `<component>-<new-ref>`, title `<component> <new-ref> - cu.. py..
-   torch..` (see `ci/release_meta.py`) - uploads the wheel there, and
+   push also creates that component's per-Python persistent releases -
+   one tag per interpreter (`<component>-<new-ref>` for legacy 3.12,
+   `<component>-<new-ref>-pyX.Y` otherwise; see "Release naming" below and
+   `ci/release_meta.py`) - uploads each wheel to its matching release, and
    republishes the index - no tag push needed to make it `pip
-   install`-able. The previous ref's release is left untouched as history.
+   install`-able. The previous ref's releases are left untouched as
+   history.
 
 `apex` tracks `main` unpinned (matches verl's own Dockerfiles) - there is no
 version to bump for it.
@@ -43,8 +45,12 @@ Checklist:
       `max_jobs`, `runs_on`, `arches`, `extra_env`) - follow the schema
       comments already in that file. `wheel_packages` must list every
       distribution the build uploads; push builds use it to detect a complete
-      matching release. Start with `arches: [x86_64]` and add arm64 later
-      (see below).
+      matching per-Python release. Start with `arches: [x86_64]` and add arm64
+      later
+      (see below). Leave `python_versions` unset to build for every
+      interpreter in the matrix (3.11 + 3.12); pin `python_versions: ["3.12"]`
+      only for `py3-none-any` wheels or upstream `requires-python >=3.12`
+      components (see "Python versions" below).
 - [ ] Create `ci/build_scripts/<builder>.sh`. Copy the shape of an existing
       script (`ci/build_scripts/apex.sh` is a good default): shebang,
       `set -euo pipefail`, source `common.sh`, call `export_extra_env`,
@@ -52,10 +58,12 @@ Checklist:
       wheel-build command (mirror its own CI/Dockerfile exactly), leave the
       wheel(s) in `dist/` relative to CWD. Then `chmod +x` it.
 - [ ] Copy an existing `.github/workflows/build-<component>.yml` to
-      `build-<new-component>.yml`; update its `name:`, `paths:` filter
-      entries, the `--component <name>` argument, and the `component:` input
-      passed to `_ensure_release.yml` in the `ensure-release` job. Leave the
-      reusable workflow calls' structure and the `publish-index` job
+      `build-<new-component>.yml`; update its `name:`, the `paths:` filter
+      entries, and the `--component <name>` argument. The release is
+      created inline by `_build.yml` (keyed by the matrix row's
+      `release_tag`, one release per component and Python version), so
+      there is no per-workflow release job to wire up. Leave the reusable
+      workflow calls' structure and the `publish-index` job
       untouched - they're otherwise component-agnostic. Start from
       `build-flashinfer.yml` for a GitHub-hosted component, or
       `build-apex.yml` for a self-hosted one (it also forwards the
@@ -104,6 +112,41 @@ Each arch is a separate job. To build just one, dispatch
 every arch. When adding a new arch to `build_matrix`, extend the static
 `options:` list of every workflow's `arch` dispatch input to match.
 
+## Python versions (3.11 / 3.12)
+
+`build_matrix` rows carry a quoted `python: "3.11"` / `"3.12"` field. A
+component builds every Python version in the matrix unless it narrows that
+with `python_versions: [...]`, the exact counterpart of `arches`. The six
+CUDA-extension components build both interpreters (their wheels carry
+`cp311`/`cp312` tags); `megatron-bridge` and `flashinfer` pin
+`python_versions: ["3.12"]` because their wheels are portable
+`py3-none-any` (a second build only re-uploads an identical asset) and
+Megatron-Bridge's upstream `requires-python` (">=3.12,<3.13") excludes 3.11.
+
+To add a Python version:
+
+- [ ] Verify torch publishes `cp<abi>` cu<cuda> wheels on **every arch** the
+      component builds (`curl -sI https://download.pytorch.org/whl/cu130/...`).
+- [ ] Append one quoted `python: "<v>"` row per arch to `build_matrix`.
+- [ ] Extend the static `options:` list of the `python` dispatch input in
+      **every** `.github/workflows/build-*.yml` (choice lists can't be
+      generated; `generate_matrix.py` rejects unknown versions).
+- [ ] Pin `python_versions: [...]` on any `py3-none-any` / `requires-python`
+      component so it doesn't rebuild or fail.
+- [ ] Validate:
+      `python3 ci/generate_matrix.py --component all` (expect 27 rows today),
+      `--component <name> --python <v>` for the smoke subset, and
+      `cd ci && python3 -m unittest test_generate_matrix`.
+
+To build just one interpreter, dispatch with the `python` input (or pass
+`--python <v>` locally); an opted-out component yields an empty matrix and
+its build job is skipped. Each interpreter publishes to its **own** release
+(tag `<component>-<ref>-pyX.Y`, except the legacy 3.12 release, which keeps
+the bare `<component>-<ref>` tag), and its title lists only that
+interpreter's combos. Adding a version therefore only builds the new
+interpreter's rows; existing interpreters' releases keep their tag/title
+and stay skippable.
+
 ## Arch-list conventions
 
 `torch_cuda_arch_list` in `versions.yaml` is canonical dotted+semicolon form
@@ -120,16 +163,23 @@ every arch. When adding a new arch to `build_matrix`, extend the static
 
 ## Release naming
 
-Each component publishes to its **own** persistent GitHub Release (no
-single combined release for the whole repo): tag `<component>-<ref>`,
-title `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]`
-(one segment per `versions.yaml` `build_matrix` entry the component is built
-for, with the `x86_64` arch left implicit). This is computed by
-`ci/release_meta.py` and created/refreshed by the reusable
-`.github/workflows/_ensure_release.yml` workflow - don't hand-roll
-`gh release create`/`edit` calls elsewhere. Bumping a component's `ref`
-starts a brand-new release under a new tag; it never renames or reuses the
-previous ref's release.
+Each component publishes to its **own** persistent GitHub Release **per
+Python version** (no single combined release for the whole repo). The
+legacy interpreter 3.12 keeps the bare tag `<component>-<ref>`; every
+other interpreter uses `<component>-<ref>-pyX.Y` (e.g.
+`<component>-<ref>-py3.11`). The title is
+`<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]`
+with one segment per `versions.yaml` `build_matrix` entry **for that
+interpreter** (the `x86_64` arch left implicit), so a 3.11 release lists
+only 3.11 rows. Tag, title, notes and manifest are computed by
+`ci/release_meta.py` - which self-selects the running interpreter after
+`setup-python` when `--python` is not passed - and the release is
+created/refreshed inline by `_build.yml` on push builds. Don't hand-roll
+`gh release create`/`edit` calls elsewhere.
+`.github/workflows/_ensure_release.yml` is a legacy, currently uncalled
+helper that only manages 3.12 bare-tag releases. Bumping a component's
+`ref` starts brand-new releases under new tags; it never renames or reuses
+the previous ref's.
 
 ## Key invariant
 

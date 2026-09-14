@@ -97,7 +97,7 @@ body:
         - label: "Build script syntax-checked: `bash -n ci/build_scripts/<builder>.sh`"
         - label: "`README.md` component table / repo layout updated"
         - label: "Green `workflow_dispatch` run (link below)"
-        - label: "Release created/refreshed with the expected tag and title (`<component>-<ref>`)"
+        - label: "Release created/refreshed with the expected per-Python tag and title (bare `<component>-<ref>` for legacy 3.12, `<component>-<ref>-pyX.Y` otherwise)"
         - label: "Every distribution in `wheel_packages` uploaded to that release"
         - label: "`publish-index.yml` re-run and the wheel is `pip install`-able from the index"
 

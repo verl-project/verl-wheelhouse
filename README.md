@@ -28,10 +28,13 @@ GitHub-hosted runners (disk cleanup, swap space, capped parallelism,
 resumable build caches).
 
 Wheels are published to [GitHub Releases](../../releases) - one persistent
-release per component, named after that component and its pinned dependency
-versions (e.g. `transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.11.0`, tag
-`transformer-engine-v2.16.1`) - and to a static [GitHub Pages](https://pages.github.com/)
-PEP 503 "simple" package index, so they're directly `pip install`-able.
+release per component and Python version, named after that component and its
+pinned dependency versions (e.g. the 3.12 release
+`transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.11.0`, tag
+`transformer-engine-v2.16.1`; the 3.11 wheels live on the separate
+`transformer-engine-v2.16.1-py3.11` release) - and to a static
+[GitHub Pages](https://pages.github.com/) PEP 503 "simple" package index, so
+they're directly `pip install`-able.
 
 ## Repo layout
 
@@ -39,7 +42,7 @@ PEP 503 "simple" package index, so they're directly `pip install`-able.
 versions.yaml             # THE editable/extendable version map (see below), kept in the project's base dir
 ci/
   generate_matrix.py      # expands versions.yaml into a GH Actions matrix
-  release_meta.py          # computes each component's release tag/title/notes
+  release_meta.py          # release tag/title/notes per component x Python
   build_index.py          # builds the static PEP 503 index from release assets
   build_scripts/
     common.sh              # shared bash helpers, sourced by every script below
@@ -55,7 +58,7 @@ ci/
     enable_deep_ep_sm80.py  # fat-bin Ampere+Hopper for deep-ep
 .github/workflows/
   _build.yml              # reusable single-combination build workflow
-  _ensure_release.yml     # reusable: create/update a component's release
+  _ensure_release.yml     # legacy helper: create/update 3.12 bare-tag releases
   build-apex.yml
   build-transformer-engine.yml
   build-flash-attention.yml
@@ -80,16 +83,19 @@ the project's base directory - no Python, no workflow YAML - needs to
 change for routine version bumps:
 
 - **`build_matrix`**: the CPU arch / CUDA / Python / Torch combinations to
-  build. Seeded with CUDA `13.0.2`, Python `3.12`, Torch `2.11.0` (matching
-  both verl Dockerfiles' `ARG` defaults), on `x86_64` and `aarch64`. Add
-  another entry to build more combinations - every component is built once
-  per entry here, minus the ones its `arches` filter excludes.
+  build. Seeded with CUDA `13.0.2`, Python `3.11` and `3.12`, Torch `2.11.0`
+  (3.12 matches both verl Dockerfiles' `ARG` defaults; 3.11 is added because
+  torch publishes cp311 cu130 wheels for both arches and downstream envs
+  still run it), on `x86_64` and `aarch64`. Add another entry to build more
+  combinations - every component is built once per entry here, minus the ones
+  its `arches` / `python_versions` filters exclude.
 - **`components`**: per-submodule config - the git `ref` to build (branch,
   tag, or commit; overrides whatever commit the submodule pointer in this
   repo is on), which `ci/build_scripts/<builder>.sh` to run, the CUDA arch
   list, whether cuDNN is required, `max_jobs`, the runner label, which CPU
-  arches to build for (`arches`) with optional per-arch field overrides
-  (`arch_overrides`), and any extra environment variables.
+  arches to build for (`arches`) and which Python versions (`python_versions`)
+  with optional per-arch field overrides (`arch_overrides`), and any extra
+  environment variables.
 - **`verl_reference_versions`**: versions verl's Dockerfiles pin for things
   this repo does *not* build (`transformers`, `trl`, `nsight_systems`,
   `megatron`, `verl` itself) - tracked here purely for compatibility
@@ -116,26 +122,43 @@ python3 ci/generate_matrix.py --component apex | python3 -m json.tool
 python3 ci/generate_matrix.py --component all
 ```
 
-## Releases: one persistent release per component
+## Releases: one persistent release per component and Python version
 
-Every component gets its **own** GitHub Release - there is no single
-combined release for "the repo" as a whole. `ci/release_meta.py` computes,
-for a component and its currently-pinned `ref` in `versions.yaml`:
+Every component gets **its own GitHub Release for each Python version it
+builds for** - there is no single combined release for "the repo" as a whole,
+and the interpreters never share a release. `ci/release_meta.py` computes,
+for a component, one Python version and its currently-pinned `ref` in
+`versions.yaml`:
 
-- **tag**: `<component>-<ref>`, e.g. `transformer-engine-v2.16.1`
+- **tag**: `<component>-<ref>` for the interpreter the wheelhouse shipped
+  before per-Python releases (currently 3.12, the *legacy* tag, kept stable
+  so releases already on GitHub keep their identity and skip detection), and
+  `<component>-<ref>-pyX.Y` for every other interpreter, e.g.
+  `transformer-engine-v2.16.1-py3.11`
 - **title**: `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]`
-  (one segment per `build_matrix` entry the component is built for, with the
-  `x86_64` arch left implicit), e.g. `transformer-engine v2.16.1 - cu13.0.2
-  py3.12 torch2.11.0` or `flash-attention v2.8.3 - cu13.0.2 py3.12
-  torch2.11.0; aarch64 cu13.0.2 py3.12 torch2.11.0`
+  with one segment per `build_matrix` row **of that Python version** and the
+  `x86_64` arch left implicit, e.g. `apex master - cu13.0.2 py3.11
+  torch2.11.0; aarch64 cu13.0.2 py3.11 torch2.11.0`
 
-The reusable `.github/workflows/_ensure_release.yml` workflow creates that
-release if it doesn't exist yet, or refreshes its title (in case
-`build_matrix` changed) if it does. Rebuilding the same `ref` re-uploads
-(`--clobber`) wheels onto that same release; bumping a component's `ref` in
-`versions.yaml` starts a **brand-new** release under a new tag, leaving the
-previous release (and its wheels) attached to the old `ref` untouched as a
-historical record.
+Splitting releases per interpreter means adding a Python version creates
+new releases instead of editing existing ones: the new `cp<abi>` wheels go
+to the new `-pyX.Y` release, while the older interpreters' releases keep
+their exact tag/title/manifest and stay skippable (no churn rebuild). The
+wheels cannot collide across releases because their filenames carry
+`cp311`/`cp312` tags, and the PEP 503 index enumerates every release
+regardless of tag.
+
+The build workflow creates the release inline while uploading: `_build.yml`
+runs `ci/release_meta.py` under the matrix row's own setup-python
+interpreter, so it computes that row's tag/title without an extra workflow
+input (no `--python` is passed). The reusable
+`.github/workflows/_ensure_release.yml` workflow is a standalone way to
+pre-create or refresh the legacy 3.12 releases (it runs under Python 3.12
+and therefore self-selects the bare-tag metadata). Rebuilding the same
+`ref` re-uploads (`--clobber`) wheels onto that same release; bumping a
+component's `ref` in `versions.yaml` starts **brand-new** releases under new
+tags, leaving the previous releases (and their wheels) attached to the old
+`ref` untouched as a historical record.
 
 ## Triggering builds
 
@@ -147,10 +170,12 @@ historical record.
 - Every arch/CUDA/Python/Torch combination is an independent job on its own
   runner, with its own build cache and wheel artifact, and `fail-fast: false`
   keeps one failure from cancelling the others. A manual run additionally
-  takes an **arch** choice (`all` / `x86_64` / `aarch64`), so you can test one
-  architecture without spending hours of runner time on the others; a
-  component that doesn't opt into the chosen arch simply has nothing to build
-  and its build job is skipped. Pushes always build every arch.
+  takes an **arch** choice (`all` / `x86_64` / `aarch64`) and a **python**
+  choice (`all` / `3.11` / `3.12`), so you can test one architecture or
+  interpreter without spending hours of runner time on the others; a
+  component that doesn't opt into the chosen arch/python version simply has
+  nothing to build and its build job is skipped. Pushes always build every
+  combination the component opts into.
 - On a push, the workflow first checks the component's target release. If its
   title exactly matches the configured arch/CUDA/Python/Torch matrix and it
   contains every distribution listed in that component's `wheel_packages` for
@@ -165,11 +190,11 @@ historical record.
   publish - it's for validating the whole matrix still builds cleanly.
 - Pushing a tag matching `v*` runs `release.yml`, which is purely a
   trigger - the tag itself is not a release. It runs the full component x
-  matrix sweep and, for every component, ensures/updates that same
-  per-component release described above and uploads every wheel, then
+  matrix sweep and, for every (component, Python) pair, ensures/updates the
+  matching release described above and uploads every wheel, then
   finishes by republishing the package index. Use this to force a fresh,
   citable rebuild of everything at once; ordinary `main` pushes already keep
-  each component's release up to date incrementally.
+  each component's releases up to date incrementally.
 - `publish-index.yml` can also be run standalone (or fires automatically
   whenever a release is published/edited/deleted) to refresh the index
   without rebuilding any wheels.
@@ -186,8 +211,8 @@ historical record.
 
 The index is published to GitHub Pages at
 <https://verl-project.github.io/verl-wheelhouse/simple/>, and is refreshed
-whenever a wheel lands on a component's release (from a `main` push or a
-`release.yml` sweep):
+whenever a wheel lands on one of a component's releases (from a `main` push
+or a `release.yml` sweep):
 
 ```bash
 pip install --extra-index-url https://verl-project.github.io/verl-wheelhouse/simple/ flash-attn
@@ -195,8 +220,10 @@ pip install --extra-index-url https://verl-project.github.io/verl-wheelhouse/sim
 ```
 
 Or install a specific wheel directly from that component's
-[release page](../../releases) - look for the tag `<component>-<ref>`, e.g.
-`transformer-engine-v2.16.1`.
+[release page](../../releases) - look for the tag `<component>-<ref>` on
+the legacy 3.12 release (e.g. `transformer-engine-v2.16.1`) or
+`<component>-<ref>-pyX.Y` for other interpreters (e.g.
+`transformer-engine-v2.16.1-py3.11`).
 
 On a fork, substitute your own `https://<owner>.github.io/<repo>/simple/`
 and enable Pages first (Settings → Pages → Source: GitHub Actions);
@@ -215,6 +242,18 @@ in from `${{ github.repository }}`, so no other change is needed.
   release. `flashinfer` is a hybrid for the same reason - two of its three
   wheels are `py3-none-any`, so `flashinfer.sh` emits those on x86_64 only and
   the arm64 job contributes just the arch-specific `flashinfer-jit-cache`.
+- **The six CUDA-extension components build for both Python 3.11 and 3.12;
+  `Megatron-Bridge` and `flashinfer` pin `python_versions: ["3.12"]`.** A
+  `cp311`/`cp312` wheel is interpreter-specific, so flash-attention, apex,
+  TransformerEngine, deep-ep, flash-mla and fast-hadamard-transform ship one
+  wheel per interpreter per arch. The pure-Python components opt out of 3.11:
+  their `py3-none-any` wheel already installs on every interpreter, so a
+  second build would only re-upload an identical asset, and Megatron-Bridge
+  additionally cannot build on 3.11 at all (upstream declares
+  `requires-python >=3.12`). Adding a Python version is a two-step change:
+  append its entries to `build_matrix` *and* add that version to the static
+  `options:` list of every workflow's `python` dispatch input (GitHub Actions
+  choice lists cannot be generated dynamically).
 - **arm64 always builds on GitHub-hosted runners.** The self-hosted machine is
   x86_64-only, so every `arch_overrides.aarch64` points at `ubuntu-24.04-arm`
   (GitHub's free 4 vCPU / 16 GB arm64 runner) rather than waiting on arm
@@ -228,8 +267,8 @@ in from `${{ github.repository }}`, so no other change is needed.
   there: `Jimver/cuda-toolkit` rewrites its apt repo path to NVIDIA's `sbsa`
   one, `common.sh`'s `install_cudnn` maps `aarch64` → `sbsa`, and
   download.pytorch.org publishes `manylinux_2_28_aarch64` CUDA wheels. Both
-  arches' wheels live on the same per-component release and the PEP 503
-  index lists them side by side - pip picks by platform tag.
+  arches' wheels live on the same per-(component, Python) release and the
+  PEP 503 index lists them side by side - pip picks by platform tag.
 - **Two components build on a self-hosted machine (x86_64 only).** `apex` and
   `TransformerEngine` are the heavy CUDA builds here, so their `runs_on`
   points at a self-hosted runner (`[self-hosted, Linux, X64]`) and their
