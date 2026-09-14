@@ -165,7 +165,35 @@ jobs:
           submodules: false
 
       - name: Checkout ${{ inputs.component }} @ ${{ inputs.ref }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Self-hosted runners (apex/transformer-engine) fetch github.com
+          # through BYTED_PROXY; empty = direct connection on GitHub-hosted.
+          HTTP_PROXY: ${{ runner.environment == 'self-hosted' && secrets.BYTED_PROXY || '' }}
+          HTTPS_PROXY: ${{ runner.environment == 'self-hosted' && secrets.BYTED_PROXY || '' }}
         run: |
+          # Self-hosted runners reach github.com through BYTED_PROXY, which
+          # answers *unauthenticated* git HTTPS with a 401; non-interactive git
+          # then dies with "fatal: could not read Username for 'https://github.com'"
+          # (the persistent workspace makes the initial `submodule update --init`
+          # succeed from cached objects, so only the pinned-ref fetch hits the
+          # network and fails). Never prompt for credentials, and propagate
+          # actions/checkout's persisted token (an http extraheader it wrote to
+          # the superproject's .git/config) to every git command in this step via
+          # GIT_CONFIG_* - the shallow init, the pinned-ref fetch below, and
+          # nested submodules (e.g. FlashMLA's cutlass) all inherit it. Fall back
+          # to a GITHUB_TOKEN basic-auth header if credential persistence is off.
+          export GIT_TERMINAL_PROMPT=0
+          auth_header="$(git config --get http.https://github.com/.extraheader || true)"
+          if [ -z "$auth_header" ] && [ -n "$GITHUB_TOKEN" ]; then
+            auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          fi
+          if [ -n "$auth_header" ]; then
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0='http.https://github.com/.extraheader'
+            export GIT_CONFIG_VALUE_0="$auth_header"
+          fi
+
           # inputs.path is the build working directory, which is usually a
           # submodule root (e.g. "apex") but is allowed to be a subdirectory
           # within one, for projects whose buildable extension lives in a
