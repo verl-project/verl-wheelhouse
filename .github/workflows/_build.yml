@@ -182,23 +182,35 @@ jobs:
             submodule_path="$(dirname "$submodule_path")"
           done
 
-          # Shallow-init the submodule (fast - uses whatever commit is
-          # currently pinned just to get a working .git + origin remote),
-          # then fetch and check out the ref versions.yaml actually pins.
-          # This decouples version bumps from the submodule pointer commit.
+          # Get a working .git + origin without ever fetching the recorded
+          # gitlink SHA by its raw ID. `git submodule update --init --depth 1`
+          # would first fetch the submodule's default-branch tip and then issue
+          # a direct SHA-in-want fetch for the gitlink when the two differ
+          # (e.g. apex pinned behind a moved `master`). GitHub serves advertised
+          # refs anonymously, but that direct-SHA request gets cut off by the
+          # self-hosted egress proxy ("expected flush after ref listing" /
+          # "could not read Username"). A named ref is fine (the fetch of
+          # inputs.ref below proves it), so bootstrap with `init` (config only,
+          # no network) + a no-checkout shallow clone of an advertised tip, and
+          # let the explicit `git fetch origin <ref>` below produce the real
+          # commit. GIT_TERMINAL_PROMPT=0 turns any auth challenge into an
+          # immediate failure instead of a hang.
           #
-          # --force throughout: self-hosted runners (see runs_on in
-          # versions.yaml, e.g. apex/transformer-engine) reuse their workspace
-          # across runs, and a build can leave tracked files *inside* the
-          # submodule modified - generated sources, in-tree build artifacts, or
-          # a build script rewriting the project's own requirement pins.
-          # The checkout above runs with submodules:false, so it only cleans
-          # the superproject and never descends into the submodule's working
-          # tree; a previous build's edits therefore survive on disk and make
-          # an unforced checkout abort with "Your local changes to the
-          # following files would be overwritten by checkout". Forcing the
-          # checkout discards that leftover state so every build starts clean.
-          git submodule update --init --force --depth 1 -- "$submodule_path"
+          # --force/clean-start rationale: self-hosted runners reuse their
+          # workspace, and a build can leave tracked files inside the submodule
+          # modified; a populated clone is reused and force-reset by the fetch +
+          # checkout below, a half-initialised dir (no .git) is removed first.
+          git submodule init -- "$submodule_path"
+          submodule_name="$(
+            git config -f .gitmodules --get-regexp 'submodule\..*\.path' \
+              | awk -v p="$submodule_path" '$2 == p { sub(/^submodule\./, ""); sub(/\.path$/, "", $1); print $1; exit }'
+          )"
+          if [ ! -e "$submodule_path/.git" ]; then
+            submodule_url="$(git config --get "submodule.${submodule_name}.url")"
+            rm -rf "$submodule_path"
+            GIT_TERMINAL_PROMPT=0 git clone --no-checkout --depth 1 \
+              "$submodule_url" "$submodule_path"
+          fi
           cd "$submodule_path"
 
           # Fetch the ref versions.yaml pins, retrying on a transient git bug.
@@ -211,7 +223,7 @@ jobs:
           # git's own on-exit lockfile cleanup, so retries start clean.
           # See https://github.com/python/cpython/issues/151365
           for attempt in 1 2 3 4 5; do
-            if git fetch --depth 1 origin "${{ inputs.ref }}"; then
+            if GIT_TERMINAL_PROMPT=0 git fetch --depth 1 origin "${{ inputs.ref }}"; then
               break
             fi
             if [ "$attempt" = 5 ]; then
@@ -223,7 +235,7 @@ jobs:
           done
 
           git checkout --detach --force FETCH_HEAD
-          git submodule update --init --recursive --force --depth 1
+          GIT_TERMINAL_PROMPT=0 git submodule update --init --recursive --force --depth 1
 
       # Both steps below only make sense on GitHub's throwaway VMs: the cleanup
       # deletes preinstalled toolchains that belong to the host on a persistent
