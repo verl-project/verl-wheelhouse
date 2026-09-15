@@ -33,11 +33,12 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
@@ -46,6 +47,31 @@ from cuda_archs import base_arch, base_arch_set, parse_arch_list, wheel_cuda_arc
 
 # versions.yaml lives in the project's base directory (one level up from ci/).
 VERSIONS_FILE = Path(__file__).resolve().parent.parent / "versions.yaml"
+
+# Repo-root-relative build-input locations. The fingerprint deliberately
+# covers only files that change the wheel's contents, never pure CI plumbing
+# (checkout/cache/upload/timeout/disk cleanup in the reusable workflow):
+#   - TOOLCHAIN_ACTION_REL provisions Python + CUDA + cuDNN + PyTorch, the one
+#     piece of CI setup that affects every wheel, so it fingerprints every
+#     component.
+#   - a component's own builder ci/build_scripts/<builder>.sh plus the leaf
+#     libraries it `source`s (resolved transitively), so changing a shared
+#     lib rebuilds only the targets that actually use it.
+#   - cuDNN provisioning, but only when requires_cudnn is set (TE today).
+#   - a component's declared patches.
+TOOLCHAIN_ACTION_REL = Path(".github/actions/build-toolchain/action.yml")
+CUDNN_PROVISION_REL = Path("ci/build_scripts/provision/install_cudnn.sh")
+BUILD_SCRIPTS_REL = Path("ci/build_scripts")
+
+# Matches a bash `source` / `.` directive that loads a sibling script through
+# the sourcing file's own directory variable, e.g.
+#   source "${SCRIPT_DIR}/lib/env.sh"
+#   source "${__lib_dir}/../lib/env.sh"
+# The variable name is intentionally arbitrary (builders use SCRIPT_DIR, leaf
+# libs use a private __lib_dir); group 1 is the path relative to that var.
+_SOURCE_DIRECTIVE_RE = re.compile(
+    r"""(?m)^\s*(?:source|\.)\s+["']?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/([^"'\s]+)"""
+)
 
 # Characters not in this set get collapsed to "-" when building a release tag
 # out of a git ref, since refs (e.g. branch names) aren't guaranteed to be
@@ -90,7 +116,14 @@ _PLATFORM_TAG_ARCHES = {
 #      sm80 patch or a build script invalidates the skip even when no
 #      versions.yaml field changed. Skip detection additionally verifies the
 #      wheels attached to the release really fat-bin those arches.
-BUILD_CONFIG_SCHEMA = 2
+#   3: build_inputs re-scoped to only wheel-affecting files: the shared
+#      build-toolchain composite action, the builder, the leaf libraries it
+#      transitively sources, cuDNN provisioning (requires_cudnn only), and
+#      patches. The reusable workflow _build.yml (checkout/cache/upload/
+#      timeouts/...) and the old monolithic common.sh are no longer inputs, so
+#      pure orchestration changes skip, and a shared lib rebuilds only the
+#      targets that source it. Bumping the schema forces one full sweep.
+BUILD_CONFIG_SCHEMA = 3
 BUILD_CONFIG_MARKER = "wheelhouse-build-config"
 # Machine-readable build snapshot uploaded as a release asset alongside the
 # wheels. The release body still carries the same JSON in a hidden HTML
@@ -329,38 +362,85 @@ def _merged_component_fields(
     return cfg
 
 
+def _sourced_script_closure(root_rels: List[Path], component: str) -> List[Path]:
+    """Every shell script the given root scripts `source`, transitively.
+
+    A builder's `source "${SCRIPT_DIR}/..."` lines are the single declaration
+    of which shared helpers feed its wheel; following them recursively (leaf
+    libs may source other libs, e.g. nccl.sh sources env.sh) makes the source
+    closure the per-target fingerprint: a helper a builder never reaches can't
+    invalidate its skip, and adding a `source` automatically fingerprints the
+    new dependency with no hand-kept per-component list to drift.
+    """
+    closure: List[Path] = []
+    seen: Set[str] = set()
+    stack: List[Path] = list(root_rels)
+    while stack:
+        rel = stack.pop()
+        key = rel.as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
+        path = VERSIONS_FILE.parent / rel
+        if not path.is_file():
+            raise SystemExit(
+                f"Component {component!r} fingerprints build input {key!r}, but that file "
+                "does not exist. Fix the builder's source directives or versions.yaml."
+            )
+        closure.append(rel)
+        for dep in _SOURCE_DIRECTIVE_RE.findall(path.read_text(encoding="utf-8")):
+            target = Path(
+                posixpath.normpath(posixpath.join(rel.parent.as_posix(), dep))
+            )
+            if target.as_posix() not in seen:
+                stack.append(target)
+    return closure
+
+
 def build_input_fingerprint(
     versions: Dict[str, Any], component: str, arch: str
 ) -> List[Dict[str, str]]:
     """Sha256 of every repo file whose content changes what the wheel contains.
 
     versions.yaml captures build *inputs that are data* (ref, env, arch list);
-    the builder script, common.sh, the reusable workflow that provisions the
-    runner (CUDA toolkit / cuDNN / Python / cache) and any patches the builder
-    applies are *inputs that are code*, so editing e.g.
-    ci/patches/enable_deep_ep_sm80.py or the CUDA install step in _build.yml
-    would otherwise leave the stored manifest identical and skip a rebuild the
-    edit was meant to produce. Paths are repo-root-relative; patches are
-    declared per component in versions.yaml (`patches:`).
+    the wheel-affecting *code* inputs are: the shared build-toolchain composite
+    action (Python/CUDA/cuDNN/PyTorch provisioning, identical for every
+    component), the component's builder and the leaf libraries that builder
+    transitively sources, cuDNN provisioning for requires_cudnn components, and
+    any patches versions.yaml declares. Pure orchestration in the reusable
+    workflow (checkout/cache/upload/timeouts/disk cleanup) is deliberately
+    excluded: editing it changes speed/reliability, never the wheel, so it must
+    skip rather than force a 27-row sweep. Paths are repo-root-relative.
     """
     cfg = _merged_component_fields(versions, component, arch)
-    rel_paths: List[str] = [".github/workflows/_build.yml"]
+    roots: List[Path] = []
     builder = cfg.get("builder")
     if builder:
-        rel_paths.append(f"ci/build_scripts/{builder}.sh")
-    rel_paths.append("ci/build_scripts/common.sh")
-    rel_paths.extend(str(path) for path in (cfg.get("patches") or []))
+        roots.append(BUILD_SCRIPTS_REL / f"{builder}.sh")
+    if cfg.get("requires_cudnn"):
+        roots.append(CUDNN_PROVISION_REL)
+
+    rel_paths: List[Path] = [TOOLCHAIN_ACTION_REL]
+    rel_paths.extend(_sourced_script_closure(roots, component))
+    rel_paths.extend(Path(str(path)) for path in (cfg.get("patches") or []))
 
     fingerprint = []
-    for rel in rel_paths:
+    seen: Set[str] = set()
+    for rel in sorted(rel_paths, key=lambda path: path.as_posix()):
+        key = rel.as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
         path = VERSIONS_FILE.parent / rel
         if not path.is_file():
             raise SystemExit(
-                f"Component {component!r} fingerprints build input {rel!r}, but that file "
-                f"does not exist. Fix the component's builder/patches in versions.yaml."
+                f"Component {component!r} fingerprints build input {key!r}, but that file "
+                "does not exist. Fix the builder's source directives or versions.yaml."
             )
-        fingerprint.append({"path": rel, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
-    return sorted(fingerprint, key=lambda entry: entry["path"])
+        fingerprint.append(
+            {"path": key, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        )
+    return fingerprint
 
 
 def normalize_build_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -946,10 +1026,11 @@ def format_dry_run_report(decisions: List[Dict[str, Any]], repo: str) -> str:
                 "<sub>Each row is decided from the release title, the "
                 "`wheelhouse-build-manifest.json` release asset (dependency "
                 "versions, CUDA arch list, extra env, builder command, "
-                "`max_jobs`, `runs_on`, and sha256 fingerprints of "
-                "`_build.yml`, the builder script, `common.sh` and declared "
-                "patches), and wheel package presence. This dry run does not "
-                "download wheels; the published wheels' fatbin SM-arch "
+                "`max_jobs`, `runs_on`, and sha256 fingerprints of the "
+                "build-toolchain action, the builder script, the `lib/` "
+                "helpers it sources, cuDNN provisioning when required, and "
+                "declared patches), and wheel package presence. This dry run "
+                "does not download wheels; the published wheels' fatbin SM-arch "
                 "coverage is re-verified at push time and gated before "
                 "upload. Anything that cannot be verified fails closed "
                 "towards a rebuild.</sub>"

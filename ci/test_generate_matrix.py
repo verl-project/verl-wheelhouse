@@ -5,6 +5,7 @@ import io
 import json
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -52,8 +53,8 @@ DEMO_WHEELS = [
     ("demo_helper-1.2.3-py3-none-any.whl", 500),
 ]
 
-# A deterministic stand-in for the builder/common/patch sha256 fingerprint;
-# these tests don't care about real repo files, only about skip logic.
+# A deterministic stand-in for the toolchain/builder/lib/patch sha256
+# fingerprint; these tests don't care about real repo files, only skip logic.
 STUB_FINGERPRINT = [{"path": "ci/build_scripts/demo.sh", "sha256": "deadbeef"}]
 
 
@@ -174,7 +175,7 @@ class BuildConfigManifestTests(unittest.TestCase):
         self.assertIn("build config mismatch", reason)
 
     def test_changed_build_input_hash_forces_rebuild(self) -> None:
-        # A patch/builder/_build.yml edit changes a sha256 in build_inputs;
+        # A patch/builder/lib/toolchain edit changes a sha256 in build_inputs;
         # no versions.yaml pin moved, but the rebuild the edit was meant to
         # ship must not be skipped.
         release = make_release(self.versions, [DEMO_WHEELS[0]])
@@ -397,6 +398,320 @@ class DryRunReportTests(unittest.TestCase):
         self.assertTrue(all(d["decision"] == "build" for d in decisions))
         self.assertEqual(2, len(decisions))
         inspect_release.assert_called()
+
+
+class BuildInputFingerprintTests(unittest.TestCase):
+    """build_input_fingerprint over the real repo files: the shared toolchain
+    action fingerprints every target; a leaf lib fingerprints only the builders
+    that source it (resolved transitively); pure CI orchestration never does."""
+
+    def _paths(self, components):
+        versions = {"components": components}
+        result = {}
+        for name in components:
+            result[name] = {
+                entry["path"]
+                for entry in generate_matrix.build_input_fingerprint(
+                    versions, name, "x86_64"
+                )
+            }
+        return result
+
+    def test_toolchain_action_fingerprints_every_target_and_workflow_does_not(self) -> None:
+        paths = self._paths(
+            {
+                "apex": {"builder": "apex"},
+                "transformer_engine": {
+                    "builder": "transformer_engine",
+                    "requires_cudnn": True,
+                },
+                "deep_ep": {
+                    "builder": "deep_ep",
+                    "patches": ["ci/patches/enable_deep_ep_sm80.py"],
+                },
+            }
+        )
+        action = ".github/actions/build-toolchain/action.yml"
+        for component_paths in paths.values():
+            self.assertIn(action, component_paths)
+            # The reusable workflow is pure orchestration; editing it must skip.
+            self.assertNotIn(".github/workflows/_build.yml", component_paths)
+            # The old monolith must be gone from every fingerprint.
+            self.assertNotIn("ci/build_scripts/common.sh", component_paths)
+
+    def test_builder_only_sources_its_own_leaf_lib_closure(self) -> None:
+        paths = self._paths(
+            {
+                "apex": {"builder": "apex"},
+                "transformer_engine": {"builder": "transformer_engine"},
+                "flash_attention": {"builder": "flash_attention"},
+                "flash_mla": {"builder": "flash_mla"},
+                "deep_ep": {"builder": "deep_ep"},
+                "flashinfer": {"builder": "flashinfer"},
+            }
+        )
+        # env.sh is sourced (directly or via another lib) by every builder.
+        for component_paths in paths.values():
+            self.assertIn("ci/build_scripts/lib/env.sh", component_paths)
+        # nccl.sh is reached only by transformer_engine (it sources env.sh
+        # itself, exercising the lib -> lib transitive edge).
+        self.assertIn("ci/build_scripts/lib/nccl.sh", paths["transformer_engine"])
+        for component in ("apex", "flash_attention", "flash_mla", "deep_ep", "flashinfer"):
+            self.assertNotIn("ci/build_scripts/lib/nccl.sh", paths[component])
+        # arch.sh only feeds the two builders that flatten the arch list.
+        self.assertIn("ci/build_scripts/lib/arch.sh", paths["transformer_engine"])
+        self.assertIn("ci/build_scripts/lib/arch.sh", paths["flash_attention"])
+        self.assertNotIn("ci/build_scripts/lib/arch.sh", paths["apex"])
+        # wheel_pack.sh only feeds the two builders that strip the local tag.
+        self.assertIn("ci/build_scripts/lib/wheel_pack.sh", paths["deep_ep"])
+        self.assertIn("ci/build_scripts/lib/wheel_pack.sh", paths["flash_mla"])
+        self.assertNotIn("ci/build_scripts/lib/wheel_pack.sh", paths["transformer_engine"])
+        # The flashinfer-only download helper stays on the flashinfer target.
+        self.assertIn("ci/build_scripts/lib/flashinfer.sh", paths["flashinfer"])
+        self.assertNotIn("ci/build_scripts/lib/flashinfer.sh", paths["deep_ep"])
+
+    def test_each_builder_itself_and_its_patch_are_fingerprinted(self) -> None:
+        paths = self._paths(
+            {
+                "deep_ep": {
+                    "builder": "deep_ep",
+                    "patches": ["ci/patches/enable_deep_ep_sm80.py"],
+                }
+            }
+        )["deep_ep"]
+        self.assertIn("ci/build_scripts/deep_ep.sh", paths)
+        self.assertIn("ci/patches/enable_deep_ep_sm80.py", paths)
+
+    def test_cudnn_provisioning_only_for_requires_cudnn(self) -> None:
+        paths = self._paths(
+            {
+                "transformer_engine": {
+                    "builder": "transformer_engine",
+                    "requires_cudnn": True,
+                },
+                "apex": {"builder": "apex"},
+            }
+        )
+        cudnn = "ci/build_scripts/provision/install_cudnn.sh"
+        self.assertIn(cudnn, paths["transformer_engine"])
+        self.assertNotIn(cudnn, paths["apex"])
+
+    def test_missing_build_input_fails_closed(self) -> None:
+        versions = {"components": {"ghost": {"builder": "no_such_builder"}}}
+        with self.assertRaises(SystemExit):
+            generate_matrix.build_input_fingerprint(versions, "ghost", "x86_64")
+
+
+class RebuildScopeTests(unittest.TestCase):
+    """End-to-end scope of the rebuild decision over an isolated temp repo:
+
+    for an edit to each kind of build input, assert exactly which targets'
+    fingerprints change (=> rebuild) and which stay byte-identical (=> skip).
+    Influential edits (toolchain, a sourced lib, a builder, a patch, cuDNN)
+    must change only the targets that consume them; no-influence orchestration
+    (the reusable workflow) must change none.
+    """
+
+    COMPONENTS = ("alpha", "beta", "gamma")
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        # build_input_fingerprint resolves every path from VERSIONS_FILE's
+        # parent, so repointing it redirects the whole scan at the temp repo.
+        self._versions_patch = patch.object(
+            generate_matrix, "VERSIONS_FILE", self.root / "versions.yaml"
+        )
+        self._versions_patch.start()
+        self.addCleanup(self._versions_patch.stop)
+
+        self._write(
+            ".github/actions/build-toolchain/action.yml",
+            "name: toolchain\nsteps: []\n",
+        )
+        self._write(".github/workflows/_build.yml", "# reusable orchestration\n")
+        self._write("ci/build_scripts/lib/env.sh", "export_extra_env() { :; }\n")
+        self._write("ci/build_scripts/lib/arch.sh", "arch_list_strip_dots() { :; }\n")
+        self._write(
+            "ci/build_scripts/lib/nccl.sh",
+            '__lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+            'source "${__lib_dir}/env.sh"\n'
+            "unset __lib_dir\n"
+            "install_nccl() { :; }\n",
+        )
+        self._write(
+            "ci/build_scripts/provision/install_cudnn.sh",
+            '__p="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+            'source "${__p}/../lib/env.sh"\n'
+            "install_cudnn() { :; }\n",
+        )
+        # alpha sources only env; beta sources nccl (which transitively pulls
+        # env); gamma sources env, needs cuDNN and declares a patch.
+        self._write(
+            "ci/build_scripts/alpha.sh",
+            'SCRIPT_DIR="x"\nsource "${SCRIPT_DIR}/lib/env.sh"\nalpha_build\n',
+        )
+        self._write(
+            "ci/build_scripts/beta.sh",
+            'SCRIPT_DIR="x"\nsource "${SCRIPT_DIR}/lib/nccl.sh"\nbeta_build\n',
+        )
+        self._write(
+            "ci/build_scripts/gamma.sh",
+            'SCRIPT_DIR="x"\nsource "${SCRIPT_DIR}/lib/env.sh"\ngamma_build\n',
+        )
+        self._write("ci/patches/gamma.py", "# gamma build-time patch\n")
+
+        self.versions = {
+            "components": {
+                "alpha": {"builder": "alpha"},
+                "beta": {"builder": "beta"},
+                "gamma": {
+                    "builder": "gamma",
+                    "requires_cudnn": True,
+                    "patches": ["ci/patches/gamma.py"],
+                },
+            }
+        }
+
+    def _write(self, rel: str, text: str) -> None:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _append(self, rel: str, line: str) -> None:
+        with (self.root / rel).open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+    def _snapshot(self):
+        return {
+            name: {
+                entry["path"]: entry["sha256"]
+                for entry in generate_matrix.build_input_fingerprint(
+                    self.versions, name, "x86_64"
+                )
+            }
+            for name in self.COMPONENTS
+        }
+
+    def _changed(self, before, after):
+        """{component: set of fingerprint paths whose sha/set changed}."""
+        changed = {}
+        for name in self.COMPONENTS:
+            paths = set(before[name]) | set(after[name])
+            changed[name] = {
+                path for path in paths if before[name].get(path) != after[name].get(path)
+            }
+        return changed
+
+    def test_baseline_closures(self) -> None:
+        snap = self._snapshot()
+        action = ".github/actions/build-toolchain/action.yml"
+        for name in self.COMPONENTS:
+            self.assertIn(action, snap[name])
+            self.assertNotIn(".github/workflows/_build.yml", snap[name])
+            self.assertIn("ci/build_scripts/lib/env.sh", snap[name])
+        # nccl.sh reaches beta alone (via the lib -> lib transitive edge);
+        # arch.sh is sourced by nobody and therefore nowhere; cuDNN only gamma.
+        self.assertNotIn("ci/build_scripts/lib/nccl.sh", snap["alpha"])
+        self.assertIn("ci/build_scripts/lib/nccl.sh", snap["beta"])
+        self.assertNotIn("ci/build_scripts/lib/nccl.sh", snap["gamma"])
+        for name in self.COMPONENTS:
+            self.assertNotIn("ci/build_scripts/lib/arch.sh", snap[name])
+        self.assertIn(
+            "ci/build_scripts/provision/install_cudnn.sh", snap["gamma"]
+        )
+        self.assertNotIn(
+            "ci/build_scripts/provision/install_cudnn.sh", snap["beta"]
+        )
+        self.assertIn("ci/patches/gamma.py", snap["gamma"])
+
+    def test_fingerprint_is_stable_without_an_edit(self) -> None:
+        before = self._snapshot()
+        after = self._snapshot()
+        self.assertEqual(self._changed(before, after), {n: set() for n in self.COMPONENTS})
+
+    def test_workflow_orchestration_edit_has_no_influence(self) -> None:
+        # The exact TE failure class: touching upload timeouts/cache/checkout in
+        # the reusable workflow must not rebuild a single wheel.
+        before = self._snapshot()
+        self._append(".github/workflows/_build.yml", "# tweak upload timeout\n")
+        changed = self._changed(before, self._snapshot())
+        self.assertEqual(changed, {n: set() for n in self.COMPONENTS})
+
+    def test_toolchain_edit_rebuilds_every_target(self) -> None:
+        before = self._snapshot()
+        self._append(".github/actions/build-toolchain/action.yml", "# bump cuda\n")
+        changed = self._changed(before, self._snapshot())
+        action = ".github/actions/build-toolchain/action.yml"
+        for name in self.COMPONENTS:
+            self.assertEqual(changed[name], {action}, name)
+
+    def test_shared_lib_edit_rebuilds_only_targets_that_source_it(self) -> None:
+        # env.sh is on every target's closure -> all rebuild.
+        before = self._snapshot()
+        self._append("ci/build_scripts/lib/env.sh", "env_changed=1\n")
+        changed = self._changed(before, self._snapshot())
+        env = "ci/build_scripts/lib/env.sh"
+        for name in self.COMPONENTS:
+            self.assertEqual(changed[name], {env}, name)
+
+        # nccl.sh is on beta's closure alone -> only beta rebuilds.
+        before = self._snapshot()
+        self._append("ci/build_scripts/lib/nccl.sh", "nccl_changed=1\n")
+        changed = self._changed(before, self._snapshot())
+        nccl = "ci/build_scripts/lib/nccl.sh"
+        self.assertEqual(changed["alpha"], set())
+        self.assertEqual(changed["beta"], {nccl})
+        self.assertEqual(changed["gamma"], set())
+
+        # arch.sh is sourced by nobody -> editing it rebuilds nothing, even
+        # though it lives under the fingerprinted ci/build_scripts tree.
+        before = self._snapshot()
+        self._append("ci/build_scripts/lib/arch.sh", "arch_changed=1\n")
+        changed = self._changed(before, self._snapshot())
+        self.assertEqual(changed, {n: set() for n in self.COMPONENTS})
+
+    def test_builder_edit_rebuilds_only_that_target(self) -> None:
+        before = self._snapshot()
+        self._append("ci/build_scripts/alpha.sh", "alpha_tweak=1\n")
+        changed = self._changed(before, self._snapshot())
+        builder = "ci/build_scripts/alpha.sh"
+        self.assertEqual(changed["alpha"], {builder})
+        self.assertEqual(changed["beta"], set())
+        self.assertEqual(changed["gamma"], set())
+
+    def test_patch_edit_rebuilds_only_declaring_target(self) -> None:
+        before = self._snapshot()
+        self._append("ci/patches/gamma.py", "# patch tweak\n")
+        changed = self._changed(before, self._snapshot())
+        self.assertEqual(changed["alpha"], set())
+        self.assertEqual(changed["beta"], set())
+        self.assertEqual(changed["gamma"], {"ci/patches/gamma.py"})
+
+    def test_cudnn_provisioning_edit_rebuilds_only_requires_cudnn_target(self) -> None:
+        before = self._snapshot()
+        self._append(
+            "ci/build_scripts/provision/install_cudnn.sh", "cudnn_tweak=1\n"
+        )
+        changed = self._changed(before, self._snapshot())
+        cudnn = "ci/build_scripts/provision/install_cudnn.sh"
+        self.assertEqual(changed["alpha"], set())
+        self.assertEqual(changed["beta"], set())
+        self.assertEqual(changed["gamma"], {cudnn})
+
+    def test_adding_a_source_line_expands_that_targets_closure_only(self) -> None:
+        # The source closure is self-registering: a builder that newly pulls in
+        # a helper immediately fingerprints it, with no per-component list to
+        # update, and other targets are unaffected.
+        before = self._snapshot()
+        self._append("ci/build_scripts/alpha.sh", 'source "${SCRIPT_DIR}/lib/arch.sh"\n')
+        changed = self._changed(before, self._snapshot())
+        arch = "ci/build_scripts/lib/arch.sh"
+        self.assertIn(arch, changed["alpha"])
+        self.assertIn("ci/build_scripts/alpha.sh", changed["alpha"])
+        self.assertEqual(changed["beta"], set())
+        self.assertEqual(changed["gamma"], set())
 
 
 def make_python_matrix_versions(component_cfg, arches=("x86_64", "aarch64"),

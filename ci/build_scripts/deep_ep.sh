@@ -14,8 +14,14 @@
 # in a throwaway temp env that is gone by run time), so nothing regresses here.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=ci/build_scripts/common.sh
-source "${SCRIPT_DIR}/common.sh"
+# shellcheck source=ci/build_scripts/lib/env.sh
+source "${SCRIPT_DIR}/lib/env.sh"
+# shellcheck source=ci/build_scripts/lib/cuda_paths.sh
+source "${SCRIPT_DIR}/lib/cuda_paths.sh"
+# shellcheck source=ci/build_scripts/lib/rdma_nvshmem.sh
+source "${SCRIPT_DIR}/lib/rdma_nvshmem.sh"
+# shellcheck source=ci/build_scripts/lib/wheel_pack.sh
+source "${SCRIPT_DIR}/lib/wheel_pack.sh"
 
 export_extra_env
 

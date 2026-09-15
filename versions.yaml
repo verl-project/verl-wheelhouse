@@ -60,7 +60,7 @@ build_matrix:
 
   # Same dependency versions, built natively on arm64. Everything the build
   # needs exists for aarch64: Jimver/cuda-toolkit rewrites its apt repo path
-  # to NVIDIA's "sbsa" one, common.sh's install_cudnn already maps
+  # to NVIDIA's "sbsa" one, provision/install_cudnn.sh already maps
   # aarch64 -> sbsa, and download.pytorch.org publishes
   # manylinux_2_28_aarch64 CUDA wheels for this torch version. Components
   # opt in one at a time through `arches` below.
@@ -105,7 +105,7 @@ verl_reference_versions:
 #                  matrix exactly.
 # torch_cuda_arch_list: canonical arch list, e.g. "8.0;9.0;10.0;12.0" (or
 #                  null if the component hardcodes its own gencode flags).
-#                  ci/build_scripts/common.sh converts this per-component as
+#                  ci/build_scripts/lib/arch.sh converts this per-component as
 #                  needed (e.g. flash-attention/TransformerEngine want the
 #                  undotted "80;90;100;120" form). flashinfer's list already
 #                  includes PTX-family suffix letters ("9.0a"/"12.0f") since
@@ -119,9 +119,12 @@ verl_reference_versions:
 # patches:         optional list of repo-root-relative files the builder
 #                  applies to its checkout (e.g. deep-ep's sm80 rewrite). They
 #                  are sha256-fingerprinted into the release manifest, so
-#                  editing one - or the builder script / common.sh - changes
-#                  the manifest and forces a rebuild even when no version pin
-#                  moved. Paths must exist or generate_matrix.py errors out.
+#                  editing one - or the builder script, a lib/ helper it
+#                  sources, or the build-toolchain action - changes the
+#                  manifest and forces a rebuild even when no version pin
+#                  moved. Pure orchestration in _build.yml (checkout/cache/
+#                  upload/timeouts) is not fingerprinted and skips. Paths must
+#                  exist or generate_matrix.py errors out.
 # verify_wheel_archs: defaults to true. Set false to skip the fatbin checks
 #                  described under torch_cuda_arch_list - for components that
 #                  rehost prebuilt wheels or ship wheels too large to download
@@ -374,8 +377,8 @@ components:
     extra_env:
       # Must match docker/Dockerfile.uv.cu130's NVSHMEM_VERSION arg: the wheel
       # bakes an rpath to this NVSHMEM install into deep_ep_cpp.so, so the image
-      # has to end up with the same version at the same path. See common.sh's
-      # install_nvshmem.
+      # has to end up with the same version at the same path. See
+      # lib/rdma_nvshmem.sh's install_nvshmem.
       NVSHMEM_VERSION: "3.4.5"
 
   flash-mla:

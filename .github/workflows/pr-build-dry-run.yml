@@ -1,10 +1,12 @@
 name: Build plan dry run
 
-# PR check: show which component/arch rows the next push would rebuild and
-# which it would skip (with the reason), without building anything. A human
-# judges whether the plan matches the change's intent. Wheels are not
-# downloaded here (--no-verify-wheels); fatbin coverage is still re-verified
-# at push time and gated before upload in _build.yml.
+# PR checks on ci/ logic: (1) run the generate_matrix unit tests, including the
+# rebuild-scope cases that edit one influential/no-influence input in a temp
+# repo and assert exactly which targets rebuild vs skip; (2) show which
+# component/arch rows the next push would rebuild/skip (with the reason),
+# without building anything. A human judges whether the plan matches the
+# change's intent. Wheels are not downloaded here (--no-verify-wheels); fatbin
+# coverage is still re-verified at push time and gated before upload.
 on:
   pull_request:
     branches:
@@ -13,6 +15,7 @@ on:
       - versions.yaml
       - "ci/**"
       - ".github/workflows/**"
+      - ".github/actions/**"
   workflow_dispatch:
 
 permissions:
@@ -24,6 +27,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run generate_matrix unit tests
+        run: |
+          pip install -q pyyaml pytest
+          # ci/ is inserted on sys.path by pytest's prepend import mode, so the
+          # tests' `import generate_matrix` resolves with no packaging needed.
+          pytest ci/ -q
+
   build-plan:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

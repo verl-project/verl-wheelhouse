@@ -13,10 +13,13 @@ other logic needs to change for routine work.
 | `versions.yaml` | The version map: arch/CUDA/Python/Torch build matrix + per-component config |
 | `ci/generate_matrix.py` | Expands `versions.yaml` into the GitHub Actions matrix (no edits needed for routine work) |
 | `ci/release_meta.py` | Computes each (component, Python) release's tag/title/notes (no edits needed for routine work) |
-| `ci/build_scripts/common.sh` | Shared bash helpers (no edits needed unless adding new shared logic) |
+| `ci/build_scripts/lib/*.sh` | Shared bash leaf helpers; a builder sources only the ones it calls |
+| `ci/build_scripts/provision/install_cudnn.sh` | cuDNN provisioning for `requires_cudnn: true` components |
+| `ci/runner/free_disk_space.sh` | GitHub-hosted disk cleanup; CI-only, never part of the build fingerprint |
 | `ci/build_scripts/<builder>.sh` | The actual wheel-build command for one component |
+| `.github/actions/build-toolchain/action.yml` | Provisions Python/CUDA/cuDNN/PyTorch; the one shared step that changes wheel contents |
 | `.github/workflows/build-<component>.yml` | Per-component trigger workflow |
-| `.github/workflows/_build.yml` | Reusable build workflow (no edits needed) |
+| `.github/workflows/_build.yml` | Reusable build workflow: pure orchestration/checkout/cache/upload (no edits needed; changing it never triggers a rebuild) |
 | `.github/workflows/_ensure_release.yml` | Legacy helper for 3.12 bare-tag releases only; release creation now runs inline in `_build.yml` (no edits needed) |
 | `.github/workflows/build-all.yml`, `release.yml` | Already build every component via `--component all` (no edits needed) |
 
@@ -30,7 +33,9 @@ other logic needs to change for routine work.
    - New build-time environment variables or flags → update
      `ci/build_scripts/<builder>.sh` and/or `extra_env` in `versions.yaml`.
    - A cuDNN version bump or new system package requirement → update
-     `requires_cudnn` and/or `ci/build_scripts/common.sh`'s `install_cudnn`.
+     `requires_cudnn` and/or the cuDNN step in
+     `.github/actions/build-toolchain/action.yml` (the install itself lives in
+     `ci/build_scripts/provision/install_cudnn.sh`).
 4. Regenerate and sanity-check the matrix locally:
 
    ```bash
@@ -45,9 +50,12 @@ other logic needs to change for routine work.
    CUDA/Python/Torch title; the release's `wheelhouse-build-manifest.json`
    asset (a snapshot of every build input - dependency versions,
    `torch_cuda_arch_list`, env vars, the builder command, `max_jobs`,
-   `runs_on`, and sha256 fingerprints of `_build.yml`, the builder script,
-   `common.sh` and any declared `patches`; a copy is also embedded in the
-   release notes as a fallback); the expected `wheel_packages` on both CPU
+   `runs_on`, and sha256 fingerprints of the shared build-toolchain action,
+   the builder script, the `lib/*.sh` helpers that builder `source`s
+   (resolved transitively, per target), cuDNN provisioning when
+   `requires_cudnn` is set, and any declared `patches`; a copy is also
+   embedded in the release notes as a fallback); the expected
+   `wheel_packages` on both CPU
    arches; and - downloaded and inspected directly - that the published
    wheels' `.nv_fatbin` sections actually cover every SM arch
    `torch_cuda_arch_list` promises. Anything unverifiable (download failure,
@@ -114,7 +122,7 @@ Worked checklist, using a hypothetical `xformers` component as the example:
    #!/usr/bin/env bash
    set -euo pipefail
    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-   source "${SCRIPT_DIR}/common.sh"
+   source "${SCRIPT_DIR}/lib/env.sh"
 
    export_extra_env
    # ... install prerequisite pip packages, export the project's own
@@ -129,14 +137,20 @@ Worked checklist, using a hypothetical `xformers` component as the example:
    its CWD already set to the component's checkout (see `_build.yml`'s
    `working-directory`), and must leave the final wheel(s) in `dist/`
    relative to that CWD - the reusable workflow uploads `<path>/dist/*.whl`.
+   Source only the leaf helpers you actually need from `lib/` (and any
+   provisioning script) - those `source` lines are themselves the build
+   fingerprint, so a shared helper change rebuilds only targets that source
+   it. A leaf helper may `source` other helpers; that dependency is followed
+   transitively and needs no registration elsewhere.
 
 4. **Copy a per-component workflow.** Duplicate
    `.github/workflows/build-flashinfer.yml` to
    `.github/workflows/build-xformers.yml` and adjust:
    - `name:` → `Build xformers`
-   - the `paths:` entries → `versions.yaml`, `ci/build_scripts/common.sh`,
-     `ci/build_scripts/xformers.sh`, `.github/workflows/_build.yml`,
-     `.github/workflows/build-xformers.yml`
+   - the `paths:` entries → `versions.yaml`, `ci/generate_matrix.py`,
+     `ci/build_scripts/**`, `ci/patches/**`, `.github/actions/**`,
+     `.github/workflows/build-xformers.yml` (the reusable `_build.yml` is
+     deliberately excluded: it is orchestration and its edits skip)
    - the `--component flashinfer` argument in the `compute-matrix` job →
      `--component xformers`
 
@@ -245,8 +259,9 @@ x86_64-only components keep their existing titles and are not disturbed when
 a new arch enters `build_matrix`.
 
 The rest of the toolchain is already arch-agnostic: `Jimver/cuda-toolkit`
-switches its apt repo to NVIDIA's `sbsa` path on arm64, `common.sh`'s
-`install_cudnn` maps `aarch64` → `sbsa`, `install_nccl` resolves its version
+switches its apt repo to NVIDIA's `sbsa` path on arm64,
+`provision/install_cudnn.sh`'s `install_cudnn` maps `aarch64` → `sbsa`,
+`lib/nccl.sh`'s `install_nccl` resolves its version
 from whatever repo is configured, and `pip install torch --index-url
 .../cu130` picks the `manylinux_2_28_aarch64` wheel by itself.
 
@@ -322,7 +337,7 @@ where needed:
 | Consumer | Format | Handled by |
 |---|---|---|
 | apex, deep-ep | dotted + semicolons, e.g. `8.0;9.0;12.0` | used as-is |
-| flash-attention, TransformerEngine | undotted, e.g. `80;90;120` | `ci/build_scripts/common.sh`'s `arch_list_strip_dots` |
+| flash-attention, TransformerEngine | undotted, e.g. `80;90;120` | `ci/build_scripts/lib/arch.sh`'s `arch_list_strip_dots` |
 | flashinfer | space-separated with PTX-family suffixes, e.g. `8.0 9.0a 12.0f` | given verbatim in `versions.yaml` (suffixes can't be derived mechanically) |
 | Megatron-Bridge (pure-Python), flash-mla (hardcodes `sm90a`/`sm100f`), fast-hadamard-transform (derives nine gencodes from the toolkit version) | n/a | set `torch_cuda_arch_list: null` for components that build no CUDA code, or that hardcode their own gencode flags |
 
@@ -343,13 +358,21 @@ The arch list is a promise that gets verified, not just a build flag:
   release's wheels and re-checks the same fatbin coverage, so a wheel whose
   declared arches were never actually fat-binned is rebuilt even though
   `versions.yaml` still promises them.
-- **Build-input fingerprinting.** Editing anything that changes wheel
-  contents - the builder script, `common.sh`, `.github/workflows/_build.yml`,
-  or a file listed in a component's `patches:` - changes a sha256 in the
-  release manifest and forces a rebuild, without needing a version bump.
-  Declare every patch file the builder applies under `patches:` in
-  `versions.yaml` (paths are repo-root-relative and must exist), so the
-  fingerprint is complete.
+- **Build-input fingerprinting (scoped to wheel contents, per target).**
+  Editing anything that changes a wheel's contents changes a sha256 in the
+  release manifest and forces a rebuild, without needing a version bump. The
+  fingerprint is deliberately limited to wheel-affecting files: the shared
+  `.github/actions/build-toolchain/action.yml` (Python/CUDA/cuDNN/PyTorch,
+  every target), the component's builder, the `lib/*.sh` helpers that builder
+  `source`s (followed transitively, so a shared-helper edit rebuilds only the
+  targets that use it), cuDNN provisioning for `requires_cudnn` components,
+  and a component's `patches:`. Pure orchestration in
+  `.github/workflows/_build.yml` (checkout, cache, uploads, timeouts, disk
+  cleanup) is not fingerprinted, so those edits skip; `ci/runner/` and
+  `ci/build_scripts/provision/` hold CI/provisioning code that only enters the
+  fingerprint when actually sourced. Declare every patch file the builder
+  applies under `patches:` in `versions.yaml` (paths are repo-root-relative
+  and must exist), so the fingerprint is complete.
 
 Inspect or gate wheels manually:
 

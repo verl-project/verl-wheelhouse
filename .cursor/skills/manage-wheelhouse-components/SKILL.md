@@ -53,7 +53,10 @@ Checklist:
       components (see "Python versions" below).
 - [ ] Create `ci/build_scripts/<builder>.sh`. Copy the shape of an existing
       script (`ci/build_scripts/apex.sh` is a good default): shebang,
-      `set -euo pipefail`, source `common.sh`, call `export_extra_env`,
+      `set -euo pipefail`, set `SCRIPT_DIR`, source only the leaf helpers it
+      needs from `ci/build_scripts/lib/` (always `lib/env.sh`; the `source`
+      closure is the per-target build fingerprint, so don't source helpers it
+      doesn't call), call `export_extra_env`,
       install prerequisite pip packages, run the project's own documented
       wheel-build command (mirror its own CI/Dockerfile exactly), leave the
       wheel(s) in `dist/` relative to CWD. Then `chmod +x` it.
@@ -153,7 +156,7 @@ and stay skippable.
 (e.g. `8.0;9.0;12.0`); each build script converts it as needed:
 
 - apex: used as-is.
-- flash-attention, TransformerEngine: undotted via `common.sh`'s
+- flash-attention, TransformerEngine: undotted via `lib/arch.sh`'s
   `arch_list_strip_dots` (e.g. `80;90;120`).
 - flashinfer: given verbatim with PTX-family suffixes (e.g.
   `8.0 9.0a 12.0f`) since those can't be derived mechanically.

@@ -1,0 +1,92 @@
+name: Build toolchain (Python, CUDA, cuDNN, PyTorch)
+description: >-
+  Provision the wheel-producing toolchain for one build: Python, the CUDA
+  toolkit, optional cuDNN, and the CUDA-matched PyTorch stack. This is the one
+  piece of CI provisioning that changes wheel *contents*, so it (and only it,
+  among the workflow plumbing) is part of every build's build-input fingerprint
+  in ci/generate_matrix.py. Orchestration that does not affect the wheel (git
+  checkout, caching, disk cleanup, uploads, timeouts) stays in the reusable
+  workflow and is intentionally not fingerprinted.
+
+inputs:
+  python-version:
+    required: true
+    type: string
+  cuda-version:
+    required: true
+    type: string
+  torch-version:
+    required: true
+    type: string
+  torch-vision-version:
+    required: true
+    type: string
+  torch-audio-version:
+    required: true
+    type: string
+  requires-cudnn:
+    required: false
+    type: string
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install CUDA ${{ inputs.cuda-version }}
+      uses: Jimver/cuda-toolkit@v0.2.35
+      id: cuda-toolkit
+      with:
+        cuda: ${{ inputs.cuda-version }}
+        method: network
+        linux-local-args: '["--toolkit"]'
+        # nvcc/cudart/nvrtc/nvtx/profiler-api are genuine "cuda-<name>-X-Y" apt
+        # packages, so sub-packages (which prepends "cuda-") works for them.
+        # nvrtc-dev is separate from nvrtc: the runtime package only ships
+        # libnvrtc.so, while nvrtc.h lives in cuda-nvrtc-dev (under
+        # targets/x86_64-linux/include). nvml-dev likewise ships nvml.h for
+        # TransformerEngine's util/cuda_nvml.cpp. nvtx ships the header-only
+        # NVTX v3 API (nvtx3/nvToolsExt.h) that TransformerEngine includes from
+        # common/nvtx.h. profiler-api ships cuda_profiler_api.h, which apex
+        # and TransformerEngine megatron softmax kernels include (even though
+        # they don't call the profiler API). cublas, cusolver, cusparse,
+        # curand and cufft are NOT: NVIDIA has only ever published these as
+        # "lib<name>-X-Y" / "lib<name>-dev-X-Y" - there is no
+        # "cuda-cublas-X-Y" etc. on any CUDA version - so they must go through
+        # non-cuda-sub-packages (no prefix added) instead, with both the
+        # runtime and -dev (headers) package requested.
+        # cccl ships cuda/atomic, cuda/std/*, thrust, cub headers. CUDA 13
+        # moved them under include/cccl/; host C++ builds need the cccl
+        # include root on the search path (see ensure_cuda_cccl_include_path).
+        # driver-dev is the only home of the libcuda.so *stub* on CUDA 13
+        # (targets/<t>/lib/stubs/) - neither cudart nor cudart-dev carries it.
+        # A build machine has no NVIDIA driver, so any component that links
+        # the driver API (deep-ep's hybrid_ep extension) links that stub; see
+        # ensure_cuda_stub_library_path for the matching link-path setup.
+        sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc-dev", "nvml-dev", "nvtx", "profiler-api", "cccl", "driver-dev"]'
+        non-cuda-sub-packages: '["libcublas", "libcublas-dev", "libcusolver", "libcusolver-dev", "libcusparse", "libcusparse-dev", "libcurand", "libcurand-dev", "libcufft", "libcufft-dev"]'
+
+    - name: Install cuDNN
+      if: inputs.requires-cudnn == 'true'
+      shell: bash
+      env:
+        CUDA_VERSION: ${{ inputs.cuda-version }}
+      run: |
+        source ci/build_scripts/provision/install_cudnn.sh
+        install_cudnn
+
+    - name: Install PyTorch ${{ inputs.torch-version }}+cu${{ inputs.cuda-version }}
+      shell: bash
+      run: |
+        pip install --upgrade pip
+        TORCH_CUDA_TAG="cu$(echo '${{ inputs.cuda-version }}' | cut -d. -f1,2 | tr -d '.')"
+        pip install \
+          "torch==${{ inputs.torch-version }}" \
+          "torchvision==${{ inputs.torch-vision-version }}" \
+          "torchaudio==${{ inputs.torch-audio-version }}" \
+          --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"
+        python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"

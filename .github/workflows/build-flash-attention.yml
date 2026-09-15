@@ -23,9 +23,9 @@ on:
     paths:
       - "versions.yaml"
       - "ci/generate_matrix.py"
-      - "ci/build_scripts/common.sh"
-      - "ci/build_scripts/flash_attention.sh"
-      - ".github/workflows/_build.yml"
+      - "ci/build_scripts/**"
+      - "ci/patches/**"
+      - ".github/actions/**"
       - ".github/workflows/build-flash-attention.yml"
 
 concurrency:

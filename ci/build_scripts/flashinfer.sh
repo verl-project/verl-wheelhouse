@@ -12,8 +12,10 @@
 # this script emits jit-cache alone (see BUILD_ANY_ARCH_WHEELS below).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=ci/build_scripts/common.sh
-source "${SCRIPT_DIR}/common.sh"
+# shellcheck source=ci/build_scripts/lib/env.sh
+source "${SCRIPT_DIR}/lib/env.sh"
+# shellcheck source=ci/build_scripts/lib/flashinfer.sh
+source "${SCRIPT_DIR}/lib/flashinfer.sh"
 
 export_extra_env
 

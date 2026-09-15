@@ -12,8 +12,8 @@
 # installing in place. Run with CWD = the apex submodule checkout.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=ci/build_scripts/common.sh
-source "${SCRIPT_DIR}/common.sh"
+# shellcheck source=ci/build_scripts/lib/env.sh
+source "${SCRIPT_DIR}/lib/env.sh"
 
 export_extra_env
 

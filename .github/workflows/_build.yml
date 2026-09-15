@@ -233,7 +233,7 @@ jobs:
       - name: Free up disk space
         if: runner.environment != 'self-hosted'
         run: |
-          source ci/build_scripts/common.sh
+          source ci/runner/free_disk_space.sh
           free_disk_space
 
       - name: Set up swap space
@@ -242,62 +242,15 @@ jobs:
         with:
           swap-size-gb: 10
 
-      - name: Set up Python ${{ inputs.python-version }}
-        uses: actions/setup-python@v5
+      - name: Provision build toolchain (Python, CUDA, cuDNN, PyTorch)
+        uses: ./.github/actions/build-toolchain
         with:
           python-version: ${{ inputs.python-version }}
-
-      - name: Install CUDA ${{ inputs.cuda-version }}
-        uses: Jimver/cuda-toolkit@v0.2.35
-        id: cuda-toolkit
-        with:
-          cuda: ${{ inputs.cuda-version }}
-          method: network
-          linux-local-args: '["--toolkit"]'
-          # nvcc/cudart/nvrtc/nvtx/profiler-api are genuine "cuda-<name>-X-Y" apt
-          # packages, so sub-packages (which prepends "cuda-") works for them.
-          # nvrtc-dev is separate from nvrtc: the runtime package only ships
-          # libnvrtc.so, while nvrtc.h lives in cuda-nvrtc-dev (under
-          # targets/x86_64-linux/include). nvml-dev likewise ships nvml.h for
-          # TransformerEngine's util/cuda_nvml.cpp. nvtx ships the header-only NVTX v3
-          # API (nvtx3/nvToolsExt.h) that TransformerEngine includes from
-          # common/nvtx.h. profiler-api ships cuda_profiler_api.h, which apex
-          # and TransformerEngine megatron softmax kernels include (even though
-          # they don't call the profiler API). cublas, cusolver, cusparse,
-          # curand and cufft are NOT: NVIDIA has only ever published these as
-          # "lib<name>-X-Y" / "lib<name>-dev-X-Y" - there is no "cuda-cublas-X-Y"
-          # etc. on any CUDA version - so they must go through
-          # non-cuda-sub-packages (no prefix added) instead, with both the
-          # runtime and -dev (headers) package requested.
-          # cccl ships cuda/atomic, cuda/std/*, thrust, cub headers. CUDA 13
-          # moved them under include/cccl/; host C++ builds need the cccl
-          # include root on the search path (see ensure_cuda_cccl_include_path).
-          # driver-dev is the only home of the libcuda.so *stub* on CUDA 13
-          # (targets/<t>/lib/stubs/) - neither cudart nor cudart-dev carries it.
-          # A build machine has no NVIDIA driver, so any component that links
-          # the driver API (deep-ep's hybrid_ep extension) links that stub; see
-          # ensure_cuda_stub_library_path for the matching link-path setup.
-          sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc-dev", "nvml-dev", "nvtx", "profiler-api", "cccl", "driver-dev"]'
-          non-cuda-sub-packages: '["libcublas", "libcublas-dev", "libcusolver", "libcusolver-dev", "libcusparse", "libcusparse-dev", "libcurand", "libcurand-dev", "libcufft", "libcufft-dev"]'
-
-      - name: Install cuDNN
-        if: inputs.requires-cudnn == 'true'
-        env:
-          CUDA_VERSION: ${{ inputs.cuda-version }}
-        run: |
-          source ci/build_scripts/common.sh
-          install_cudnn
-
-      - name: Install PyTorch ${{ inputs.torch-version }}+cu${{ inputs.cuda-version }}
-        run: |
-          pip install --upgrade pip
-          TORCH_CUDA_TAG="cu$(echo '${{ inputs.cuda-version }}' | cut -d. -f1,2 | tr -d '.')"
-          pip install \
-            "torch==${{ inputs.torch-version }}" \
-            "torchvision==${{ inputs.torch-vision-version }}" \
-            "torchaudio==${{ inputs.torch-audio-version }}" \
-            --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"
-          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+          cuda-version: ${{ inputs.cuda-version }}
+          torch-version: ${{ inputs.torch-version }}
+          torch-vision-version: ${{ inputs.torch-vision-version }}
+          torch-audio-version: ${{ inputs.torch-audio-version }}
+          requires-cudnn: ${{ inputs.requires-cudnn }}
 
       - name: Restore resumable build cache
         uses: actions/cache/restore@v4
@@ -415,8 +368,11 @@ jobs:
         # wheels to the Azure blob artifact backend through BYTED_PROXY; a 30m
         # ceiling killed a transformer-engine upload mid-transfer ("Upload
         # progress stalled"). Give that path 2h; GitHub-hosted runners upload
-        # directly and keep the tight 30m ceiling.
-        timeout-minutes: ${{ runner.environment == 'self-hosted' && 120 || 30 }}
+        # directly and keep the tight 30m ceiling. Detect self-hosted from the
+        # runs_on labels versions.yaml passes in (deterministic) rather than
+        # the runner.environment context, which an older self-hosted runner
+        # binary can leave empty and which then silently fell back to 30m.
+        timeout-minutes: ${{ contains(fromJSON(inputs.runs-on), 'self-hosted') && 120 || 30 }}
         env:
           # Self-hosted runners (apex/transformer-engine) reach GitHub (and its
           # Azure blob artifact backend) via BYTED_PROXY; empty = direct
@@ -445,9 +401,10 @@ jobs:
           MANIFEST=$(python3 -c "import json; print(json.load(open('release-meta.json'))[0]['manifest_asset'])")
           python3 -c "import json; from pathlib import Path; Path('release-notes.md').write_text(json.load(open('release-meta.json'))[0]['notes'], encoding='utf-8')"
           # Machine-readable build snapshot (versions, arch list, builder
-          # command, env, sha256 of _build.yml/common.sh/builder/patches):
-          # uploaded as a release asset so push-time skip detection downloads
-          # and diffs it instead of trusting an opaque title string.
+          # command, env, sha256 of the build-toolchain action, the builder and
+          # its sourced lib/helpers, cuDNN provisioning when required, and
+          # patches): uploaded as a release asset so push-time skip detection
+          # downloads and diffs it instead of trusting an opaque title string.
           python3 -c "import json; from pathlib import Path; meta=json.load(open('release-meta.json'))[0]; Path(meta['manifest_asset']).write_text(json.dumps(meta['manifest'], indent=2, sort_keys=True) + '\n', encoding='utf-8')"
           if [ "$TAG" != "${{ inputs.release-version }}" ]; then
             echo "::error::release_meta tag ($TAG) does not match release-version (${{ inputs.release-version }})" >&2
@@ -466,8 +423,10 @@ jobs:
       - name: Upload wheel(s) to release ${{ inputs.release-version }}
         if: inputs.upload-to-release
         # Same proxy path and same large wheel as the artifact upload above:
-        # self-hosted gets 2h, GitHub-hosted keeps 30m.
-        timeout-minutes: ${{ runner.environment == 'self-hosted' && 120 || 30 }}
+        # self-hosted gets 2h, GitHub-hosted keeps 30m. Self-hosted is detected
+        # from the runs_on labels (see the artifact-upload step), not
+        # runner.environment.
+        timeout-minutes: ${{ contains(fromJSON(inputs.runs-on), 'self-hosted') && 120 || 30 }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Self-hosted runners (apex/transformer-engine) reach GitHub via
