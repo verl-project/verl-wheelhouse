@@ -45,7 +45,6 @@ ci/
   release_meta.py          # release tag/title/notes per component x Python
   build_index.py          # builds the static PEP 503 index from release assets
   build_scripts/
-    common.sh              # shared bash helpers, sourced by every script below
     apex.sh
     transformer_engine.sh
     flash_attention.sh
@@ -54,6 +53,12 @@ ci/
     deep_ep.sh
     flash_mla.sh
     fast_hadamard_transform.sh
+    lib/                   # shared leaf helpers, sourced only by the builders that use them
+      env.sh arch.sh nccl.sh cuda_paths.sh rdma_nvshmem.sh wheel_pack.sh flashinfer.sh
+    provision/
+      install_cudnn.sh     # cuDNN for requires_cudnn components (transformer-engine)
+  runner/
+    free_disk_space.sh     # GitHub-hosted disk cleanup; CI-only, never build-fingerprinted
   patches/
     enable_deep_ep_sm80.py  # fat-bin Ampere+Hopper for deep-ep
 .github/workflows/
@@ -70,6 +75,8 @@ ci/
   build-all.yml           # builds every component x every matrix combo
   release.yml             # on `v*` tag push: full-matrix build + upload
   publish-index.yml       # (re)publishes the GitHub Pages PEP 503 index
+.github/actions/
+  build-toolchain/action.yml  # Python/CUDA/cuDNN/PyTorch provisioning (shared build input)
 docs/
   maintaining-components.md  # step-by-step: upgrade a version / add a component
 .cursor/skills/
@@ -165,8 +172,10 @@ tags, leaving the previous releases (and their wheels) attached to the old
 - Each component has its own workflow (`build-<component>.yml`) that can be
   run on demand from the Actions tab (`workflow_dispatch`), and also runs
   automatically on pushes to `main` (including PR merges) that touch
-  `versions.yaml`, `ci/generate_matrix.py`, `ci/build_scripts/common.sh`, or
-  that component's build script.
+  `versions.yaml`, `ci/generate_matrix.py`, anything under
+  `ci/build_scripts/` or `ci/patches/`, `.github/actions/`, or that
+  component's workflow. The reusable `_build.yml` is intentionally not a push
+  trigger: it is orchestration only, and editing it never rebuilds a wheel.
 - Every arch/CUDA/Python/Torch combination is an independent job on its own
   runner, with its own build cache and wheel artifact, and `fail-fast: false`
   keeps one failure from cancelling the others. A manual run additionally
@@ -265,7 +274,7 @@ in from `${{ github.repository }}`, so no other change is needed.
   expected to exhaust their 5h budget and finish across a few re-runs off the
   resumable build cache. Everything else the toolchain needs already works
   there: `Jimver/cuda-toolkit` rewrites its apt repo path to NVIDIA's `sbsa`
-  one, `common.sh`'s `install_cudnn` maps `aarch64` → `sbsa`, and
+  one, `provision/install_cudnn.sh`'s `install_cudnn` maps `aarch64` → `sbsa`, and
   download.pytorch.org publishes `manylinux_2_28_aarch64` CUDA wheels. Both
   arches' wheels live on the same per-(component, Python) release and the
   PEP 503 index lists them side by side - pip picks by platform tag.
@@ -310,7 +319,7 @@ in from `${{ github.repository }}`, so no other change is needed.
   `9.0;10.0`. Separately, `deep-ep` links NVSHMEM and bakes
   `-Wl,-rpath,$NVSHMEM_DIR/lib` into its
   extension, so its wheel only resolves libnvshmem where that directory exists:
-  `common.sh`'s `install_nvshmem` therefore installs
+  `lib/rdma_nvshmem.sh`'s `install_nvshmem` therefore installs
   `nvidia-nvshmem-cu<major>==<extra_env NVSHMEM_VERSION>` into
   `/usr/local/lib/python<X.Y>/dist-packages`, the same absolute path verl's
   `docker/Dockerfile.uv.cu130` installs it to. Bumping the NVSHMEM version on
@@ -318,7 +327,7 @@ in from `${{ github.repository }}`, so no other change is needed.
   image no longer has. Both projects also append `+<short git sha>` to their
   own version with no opt-out; since GitHub rewrites `+` to `.` in release
   asset filenames (which would desync the filename from the wheel's own
-  METADATA), `common.sh`'s `strip_wheel_local_version` removes the segment
+  METADATA), `lib/wheel_pack.sh`'s `strip_wheel_local_version` removes the segment
   after the build. Their wheels are therefore plain `deep-ep 1.2.1` /
   `flash-mla 1.0.0`, and - as with `apex` - the exact commit lives in the
   release tag and title rather than in the version.

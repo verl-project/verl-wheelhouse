@@ -23,10 +23,9 @@ on:
     paths:
       - "versions.yaml"
       - "ci/generate_matrix.py"
-      - "ci/build_scripts/common.sh"
-      - "ci/build_scripts/deep_ep.sh"
-      - "ci/patches/enable_deep_ep_sm80.py"
-      - ".github/workflows/_build.yml"
+      - "ci/build_scripts/**"
+      - "ci/patches/**"
+      - ".github/actions/**"
       - ".github/workflows/build-deep-ep.yml"
 
 concurrency:

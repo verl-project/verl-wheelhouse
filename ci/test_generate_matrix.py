@@ -52,8 +52,8 @@ DEMO_WHEELS = [
     ("demo_helper-1.2.3-py3-none-any.whl", 500),
 ]
 
-# A deterministic stand-in for the builder/common/patch sha256 fingerprint;
-# these tests don't care about real repo files, only about skip logic.
+# A deterministic stand-in for the toolchain/builder/lib/patch sha256
+# fingerprint; these tests don't care about real repo files, only skip logic.
 STUB_FINGERPRINT = [{"path": "ci/build_scripts/demo.sh", "sha256": "deadbeef"}]
 
 
@@ -174,7 +174,7 @@ class BuildConfigManifestTests(unittest.TestCase):
         self.assertIn("build config mismatch", reason)
 
     def test_changed_build_input_hash_forces_rebuild(self) -> None:
-        # A patch/builder/_build.yml edit changes a sha256 in build_inputs;
+        # A patch/builder/lib/toolchain edit changes a sha256 in build_inputs;
         # no versions.yaml pin moved, but the rebuild the edit was meant to
         # ship must not be skipped.
         release = make_release(self.versions, [DEMO_WHEELS[0]])
@@ -397,6 +397,108 @@ class DryRunReportTests(unittest.TestCase):
         self.assertTrue(all(d["decision"] == "build" for d in decisions))
         self.assertEqual(2, len(decisions))
         inspect_release.assert_called()
+
+
+class BuildInputFingerprintTests(unittest.TestCase):
+    """build_input_fingerprint over the real repo files: the shared toolchain
+    action fingerprints every target; a leaf lib fingerprints only the builders
+    that source it (resolved transitively); pure CI orchestration never does."""
+
+    def _paths(self, components):
+        versions = {"components": components}
+        result = {}
+        for name in components:
+            result[name] = {
+                entry["path"]
+                for entry in generate_matrix.build_input_fingerprint(
+                    versions, name, "x86_64"
+                )
+            }
+        return result
+
+    def test_toolchain_action_fingerprints_every_target_and_workflow_does_not(self) -> None:
+        paths = self._paths(
+            {
+                "apex": {"builder": "apex"},
+                "transformer_engine": {
+                    "builder": "transformer_engine",
+                    "requires_cudnn": True,
+                },
+                "deep_ep": {
+                    "builder": "deep_ep",
+                    "patches": ["ci/patches/enable_deep_ep_sm80.py"],
+                },
+            }
+        )
+        action = ".github/actions/build-toolchain/action.yml"
+        for component_paths in paths.values():
+            self.assertIn(action, component_paths)
+            # The reusable workflow is pure orchestration; editing it must skip.
+            self.assertNotIn(".github/workflows/_build.yml", component_paths)
+            # The old monolith must be gone from every fingerprint.
+            self.assertNotIn("ci/build_scripts/common.sh", component_paths)
+
+    def test_builder_only_sources_its_own_leaf_lib_closure(self) -> None:
+        paths = self._paths(
+            {
+                "apex": {"builder": "apex"},
+                "transformer_engine": {"builder": "transformer_engine"},
+                "flash_attention": {"builder": "flash_attention"},
+                "flash_mla": {"builder": "flash_mla"},
+                "deep_ep": {"builder": "deep_ep"},
+                "flashinfer": {"builder": "flashinfer"},
+            }
+        )
+        # env.sh is sourced (directly or via another lib) by every builder.
+        for component_paths in paths.values():
+            self.assertIn("ci/build_scripts/lib/env.sh", component_paths)
+        # nccl.sh is reached only by transformer_engine (it sources env.sh
+        # itself, exercising the lib -> lib transitive edge).
+        self.assertIn("ci/build_scripts/lib/nccl.sh", paths["transformer_engine"])
+        for component in ("apex", "flash_attention", "flash_mla", "deep_ep", "flashinfer"):
+            self.assertNotIn("ci/build_scripts/lib/nccl.sh", paths[component])
+        # arch.sh only feeds the two builders that flatten the arch list.
+        self.assertIn("ci/build_scripts/lib/arch.sh", paths["transformer_engine"])
+        self.assertIn("ci/build_scripts/lib/arch.sh", paths["flash_attention"])
+        self.assertNotIn("ci/build_scripts/lib/arch.sh", paths["apex"])
+        # wheel_pack.sh only feeds the two builders that strip the local tag.
+        self.assertIn("ci/build_scripts/lib/wheel_pack.sh", paths["deep_ep"])
+        self.assertIn("ci/build_scripts/lib/wheel_pack.sh", paths["flash_mla"])
+        self.assertNotIn("ci/build_scripts/lib/wheel_pack.sh", paths["transformer_engine"])
+        # The flashinfer-only download helper stays on the flashinfer target.
+        self.assertIn("ci/build_scripts/lib/flashinfer.sh", paths["flashinfer"])
+        self.assertNotIn("ci/build_scripts/lib/flashinfer.sh", paths["deep_ep"])
+
+    def test_each_builder_itself_and_its_patch_are_fingerprinted(self) -> None:
+        paths = self._paths(
+            {
+                "deep_ep": {
+                    "builder": "deep_ep",
+                    "patches": ["ci/patches/enable_deep_ep_sm80.py"],
+                }
+            }
+        )["deep_ep"]
+        self.assertIn("ci/build_scripts/deep_ep.sh", paths)
+        self.assertIn("ci/patches/enable_deep_ep_sm80.py", paths)
+
+    def test_cudnn_provisioning_only_for_requires_cudnn(self) -> None:
+        paths = self._paths(
+            {
+                "transformer_engine": {
+                    "builder": "transformer_engine",
+                    "requires_cudnn": True,
+                },
+                "apex": {"builder": "apex"},
+            }
+        )
+        cudnn = "ci/build_scripts/provision/install_cudnn.sh"
+        self.assertIn(cudnn, paths["transformer_engine"])
+        self.assertNotIn(cudnn, paths["apex"])
+
+    def test_missing_build_input_fails_closed(self) -> None:
+        versions = {"components": {"ghost": {"builder": "no_such_builder"}}}
+        with self.assertRaises(SystemExit):
+            generate_matrix.build_input_fingerprint(versions, "ghost", "x86_64")
 
 
 def make_python_matrix_versions(component_cfg, arches=("x86_64", "aarch64"),
