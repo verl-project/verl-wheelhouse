@@ -5,6 +5,7 @@ import io
 import json
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -499,6 +500,218 @@ class BuildInputFingerprintTests(unittest.TestCase):
         versions = {"components": {"ghost": {"builder": "no_such_builder"}}}
         with self.assertRaises(SystemExit):
             generate_matrix.build_input_fingerprint(versions, "ghost", "x86_64")
+
+
+class RebuildScopeTests(unittest.TestCase):
+    """End-to-end scope of the rebuild decision over an isolated temp repo:
+
+    for an edit to each kind of build input, assert exactly which targets'
+    fingerprints change (=> rebuild) and which stay byte-identical (=> skip).
+    Influential edits (toolchain, a sourced lib, a builder, a patch, cuDNN)
+    must change only the targets that consume them; no-influence orchestration
+    (the reusable workflow) must change none.
+    """
+
+    COMPONENTS = ("alpha", "beta", "gamma")
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        # build_input_fingerprint resolves every path from VERSIONS_FILE's
+        # parent, so repointing it redirects the whole scan at the temp repo.
+        self._versions_patch = patch.object(
+            generate_matrix, "VERSIONS_FILE", self.root / "versions.yaml"
+        )
+        self._versions_patch.start()
+        self.addCleanup(self._versions_patch.stop)
+
+        self._write(
+            ".github/actions/build-toolchain/action.yml",
+            "name: toolchain\nsteps: []\n",
+        )
+        self._write(".github/workflows/_build.yml", "# reusable orchestration\n")
+        self._write("ci/build_scripts/lib/env.sh", "export_extra_env() { :; }\n")
+        self._write("ci/build_scripts/lib/arch.sh", "arch_list_strip_dots() { :; }\n")
+        self._write(
+            "ci/build_scripts/lib/nccl.sh",
+            '__lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+            'source "${__lib_dir}/env.sh"\n'
+            "unset __lib_dir\n"
+            "install_nccl() { :; }\n",
+        )
+        self._write(
+            "ci/build_scripts/provision/install_cudnn.sh",
+            '__p="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+            'source "${__p}/../lib/env.sh"\n'
+            "install_cudnn() { :; }\n",
+        )
+        # alpha sources only env; beta sources nccl (which transitively pulls
+        # env); gamma sources env, needs cuDNN and declares a patch.
+        self._write(
+            "ci/build_scripts/alpha.sh",
+            'SCRIPT_DIR="x"\nsource "${SCRIPT_DIR}/lib/env.sh"\nalpha_build\n',
+        )
+        self._write(
+            "ci/build_scripts/beta.sh",
+            'SCRIPT_DIR="x"\nsource "${SCRIPT_DIR}/lib/nccl.sh"\nbeta_build\n',
+        )
+        self._write(
+            "ci/build_scripts/gamma.sh",
+            'SCRIPT_DIR="x"\nsource "${SCRIPT_DIR}/lib/env.sh"\ngamma_build\n',
+        )
+        self._write("ci/patches/gamma.py", "# gamma build-time patch\n")
+
+        self.versions = {
+            "components": {
+                "alpha": {"builder": "alpha"},
+                "beta": {"builder": "beta"},
+                "gamma": {
+                    "builder": "gamma",
+                    "requires_cudnn": True,
+                    "patches": ["ci/patches/gamma.py"],
+                },
+            }
+        }
+
+    def _write(self, rel: str, text: str) -> None:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _append(self, rel: str, line: str) -> None:
+        with (self.root / rel).open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+    def _snapshot(self):
+        return {
+            name: {
+                entry["path"]: entry["sha256"]
+                for entry in generate_matrix.build_input_fingerprint(
+                    self.versions, name, "x86_64"
+                )
+            }
+            for name in self.COMPONENTS
+        }
+
+    def _changed(self, before, after):
+        """{component: set of fingerprint paths whose sha/set changed}."""
+        changed = {}
+        for name in self.COMPONENTS:
+            paths = set(before[name]) | set(after[name])
+            changed[name] = {
+                path for path in paths if before[name].get(path) != after[name].get(path)
+            }
+        return changed
+
+    def test_baseline_closures(self) -> None:
+        snap = self._snapshot()
+        action = ".github/actions/build-toolchain/action.yml"
+        for name in self.COMPONENTS:
+            self.assertIn(action, snap[name])
+            self.assertNotIn(".github/workflows/_build.yml", snap[name])
+            self.assertIn("ci/build_scripts/lib/env.sh", snap[name])
+        # nccl.sh reaches beta alone (via the lib -> lib transitive edge);
+        # arch.sh is sourced by nobody and therefore nowhere; cuDNN only gamma.
+        self.assertNotIn("ci/build_scripts/lib/nccl.sh", snap["alpha"])
+        self.assertIn("ci/build_scripts/lib/nccl.sh", snap["beta"])
+        self.assertNotIn("ci/build_scripts/lib/nccl.sh", snap["gamma"])
+        for name in self.COMPONENTS:
+            self.assertNotIn("ci/build_scripts/lib/arch.sh", snap[name])
+        self.assertIn(
+            "ci/build_scripts/provision/install_cudnn.sh", snap["gamma"]
+        )
+        self.assertNotIn(
+            "ci/build_scripts/provision/install_cudnn.sh", snap["beta"]
+        )
+        self.assertIn("ci/patches/gamma.py", snap["gamma"])
+
+    def test_fingerprint_is_stable_without_an_edit(self) -> None:
+        before = self._snapshot()
+        after = self._snapshot()
+        self.assertEqual(self._changed(before, after), {n: set() for n in self.COMPONENTS})
+
+    def test_workflow_orchestration_edit_has_no_influence(self) -> None:
+        # The exact TE failure class: touching upload timeouts/cache/checkout in
+        # the reusable workflow must not rebuild a single wheel.
+        before = self._snapshot()
+        self._append(".github/workflows/_build.yml", "# tweak upload timeout\n")
+        changed = self._changed(before, self._snapshot())
+        self.assertEqual(changed, {n: set() for n in self.COMPONENTS})
+
+    def test_toolchain_edit_rebuilds_every_target(self) -> None:
+        before = self._snapshot()
+        self._append(".github/actions/build-toolchain/action.yml", "# bump cuda\n")
+        changed = self._changed(before, self._snapshot())
+        action = ".github/actions/build-toolchain/action.yml"
+        for name in self.COMPONENTS:
+            self.assertEqual(changed[name], {action}, name)
+
+    def test_shared_lib_edit_rebuilds_only_targets_that_source_it(self) -> None:
+        # env.sh is on every target's closure -> all rebuild.
+        before = self._snapshot()
+        self._append("ci/build_scripts/lib/env.sh", "env_changed=1\n")
+        changed = self._changed(before, self._snapshot())
+        env = "ci/build_scripts/lib/env.sh"
+        for name in self.COMPONENTS:
+            self.assertEqual(changed[name], {env}, name)
+
+        # nccl.sh is on beta's closure alone -> only beta rebuilds.
+        before = self._snapshot()
+        self._append("ci/build_scripts/lib/nccl.sh", "nccl_changed=1\n")
+        changed = self._changed(before, self._snapshot())
+        nccl = "ci/build_scripts/lib/nccl.sh"
+        self.assertEqual(changed["alpha"], set())
+        self.assertEqual(changed["beta"], {nccl})
+        self.assertEqual(changed["gamma"], set())
+
+        # arch.sh is sourced by nobody -> editing it rebuilds nothing, even
+        # though it lives under the fingerprinted ci/build_scripts tree.
+        before = self._snapshot()
+        self._append("ci/build_scripts/lib/arch.sh", "arch_changed=1\n")
+        changed = self._changed(before, self._snapshot())
+        self.assertEqual(changed, {n: set() for n in self.COMPONENTS})
+
+    def test_builder_edit_rebuilds_only_that_target(self) -> None:
+        before = self._snapshot()
+        self._append("ci/build_scripts/alpha.sh", "alpha_tweak=1\n")
+        changed = self._changed(before, self._snapshot())
+        builder = "ci/build_scripts/alpha.sh"
+        self.assertEqual(changed["alpha"], {builder})
+        self.assertEqual(changed["beta"], set())
+        self.assertEqual(changed["gamma"], set())
+
+    def test_patch_edit_rebuilds_only_declaring_target(self) -> None:
+        before = self._snapshot()
+        self._append("ci/patches/gamma.py", "# patch tweak\n")
+        changed = self._changed(before, self._snapshot())
+        self.assertEqual(changed["alpha"], set())
+        self.assertEqual(changed["beta"], set())
+        self.assertEqual(changed["gamma"], {"ci/patches/gamma.py"})
+
+    def test_cudnn_provisioning_edit_rebuilds_only_requires_cudnn_target(self) -> None:
+        before = self._snapshot()
+        self._append(
+            "ci/build_scripts/provision/install_cudnn.sh", "cudnn_tweak=1\n"
+        )
+        changed = self._changed(before, self._snapshot())
+        cudnn = "ci/build_scripts/provision/install_cudnn.sh"
+        self.assertEqual(changed["alpha"], set())
+        self.assertEqual(changed["beta"], set())
+        self.assertEqual(changed["gamma"], {cudnn})
+
+    def test_adding_a_source_line_expands_that_targets_closure_only(self) -> None:
+        # The source closure is self-registering: a builder that newly pulls in
+        # a helper immediately fingerprints it, with no per-component list to
+        # update, and other targets are unaffected.
+        before = self._snapshot()
+        self._append("ci/build_scripts/alpha.sh", 'source "${SCRIPT_DIR}/lib/arch.sh"\n')
+        changed = self._changed(before, self._snapshot())
+        arch = "ci/build_scripts/lib/arch.sh"
+        self.assertIn(arch, changed["alpha"])
+        self.assertIn("ci/build_scripts/alpha.sh", changed["alpha"])
+        self.assertEqual(changed["beta"], set())
+        self.assertEqual(changed["gamma"], set())
 
 
 def make_python_matrix_versions(component_cfg, arches=("x86_64", "aarch64"),
