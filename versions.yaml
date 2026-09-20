@@ -20,12 +20,18 @@
 #   ARG TORCH_VISION_VERSION=0.26.0
 #   ARG TORCH_AUDIO_VERSION=2.11.0
 #
+# torch/torchvision below are deliberately ahead of those defaults (2.13.0 /
+# 0.28.0, the companion pair upstream ships together). torchaudio stays on
+# 2.11.0 because pytorch/audio published no 2.12/2.13 release; its wheel
+# declares no torch dependency, so pip still resolves the trio, and no build
+# script imports it.
+#
 # Every component in `components` below is built once per entry in this
 # list, minus the entries its `arches` / `python_versions` filters exclude.
 # Add another entry to build additional arch/CUDA/Python/Torch combinations.
 #
 # 3.12 is the version verl's own Dockerfiles pin; 3.11 is built in addition
-# because torch 2.11.0 publishes cp311 cu130 wheels for both arches and
+# because torch 2.13.0 publishes cp311 cu130 wheels for both arches and
 # downstream verl envs still run 3.11. Components that compile CUDA
 # extensions therefore ship one wheel per interpreter, while components that
 # only emit a portable py3-none-any wheel (megatron-bridge, flashinfer) opt
@@ -43,8 +49,8 @@ build_matrix:
   - arch: x86_64
     cuda: "13.0.2"
     python: "3.11"
-    torch: "2.11.0"
-    torch_vision: "0.26.0"
+    torch: "2.13.0"
+    torch_vision: "0.28.0"
     torch_audio: "2.11.0"
     cxx11_abi: "TRUE"
 
@@ -67,8 +73,8 @@ build_matrix:
   - arch: aarch64
     cuda: "13.0.2"
     python: "3.11"
-    torch: "2.11.0"
-    torch_vision: "0.26.0"
+    torch: "2.13.0"
+    torch_vision: "0.28.0"
     torch_audio: "2.11.0"
     cxx11_abi: "TRUE"
 

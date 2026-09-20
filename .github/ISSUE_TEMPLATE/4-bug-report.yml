@@ -37,7 +37,7 @@ body:
     attributes:
       label: Build combination
       description: CUDA / Python / Torch, plus the component `ref` if you know it.
-      placeholder: "cu13.0.2 py3.12 torch2.11.0, transformer-engine v2.16.1"
+      placeholder: "cu13.0.2 py3.12 torch2.13.0, transformer-engine v2.16.1"
     validations:
       required: true
 

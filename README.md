@@ -30,7 +30,7 @@ resumable build caches).
 Wheels are published to [GitHub Releases](../../releases) - one persistent
 release per component and Python version, named after that component and its
 pinned dependency versions (e.g. the 3.12 release
-`transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.11.0`, tag
+`transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.13.0`, tag
 `transformer-engine-v2.16.1`; the 3.11 wheels live on the separate
 `transformer-engine-v2.16.1-py3.11` release) - and to a static
 [GitHub Pages](https://pages.github.com/) PEP 503 "simple" package index, so
@@ -90,12 +90,13 @@ the project's base directory - no Python, no workflow YAML - needs to
 change for routine version bumps:
 
 - **`build_matrix`**: the CPU arch / CUDA / Python / Torch combinations to
-  build. Seeded with CUDA `13.0.2`, Python `3.11` and `3.12`, Torch `2.11.0`
-  (3.12 matches both verl Dockerfiles' `ARG` defaults; 3.11 is added because
-  torch publishes cp311 cu130 wheels for both arches and downstream envs
-  still run it), on `x86_64` and `aarch64`. Add another entry to build more
-  combinations - every component is built once per entry here, minus the ones
-  its `arches` / `python_versions` filters exclude.
+  build. Currently CUDA `13.0.2`, Python `3.11` and `3.12`, Torch `2.13.0`
+  (3.12 matches both verl Dockerfiles' `ARG` defaults, though torch is kept
+  ahead of their `2.11.0` pin; 3.11 is added because torch publishes cp311
+  cu130 wheels for both arches and downstream envs still run it), on
+  `x86_64` and `aarch64`. Add another entry to build more combinations -
+  every component is built once per entry here, minus the ones its `arches`
+  / `python_versions` filters exclude.
 - **`components`**: per-submodule config - the git `ref` to build (branch,
   tag, or commit; overrides whatever commit the submodule pointer in this
   repo is on), which `ci/build_scripts/<builder>.sh` to run, the CUDA arch
@@ -145,7 +146,7 @@ for a component, one Python version and its currently-pinned `ref` in
 - **title**: `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]`
   with one segment per `build_matrix` row **of that Python version** and the
   `x86_64` arch left implicit, e.g. `apex master - cu13.0.2 py3.11
-  torch2.11.0; aarch64 cu13.0.2 py3.11 torch2.11.0`
+  torch2.13.0; aarch64 cu13.0.2 py3.11 torch2.13.0`
 
 Splitting releases per interpreter means adding a Python version creates
 new releases instead of editing existing ones: the new `cp<abi>` wheels go
