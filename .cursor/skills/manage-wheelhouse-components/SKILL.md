@@ -24,9 +24,9 @@ This file has the quick-reference version.
 3. Validate: `pip install pyyaml && python3 ci/generate_matrix.py --component <name>`.
 4. Commit. Pushing to `main` auto-triggers `build-<component>.yml` (its
    `paths:` filter matches `versions.yaml`), and a successful build from a
-   push also creates that component's per-Python persistent releases -
-   one tag per interpreter (`<component>-<new-ref>` for legacy 3.12,
-   `<component>-<new-ref>-pyX.Y` otherwise; see "Release naming" below and
+   push also creates that component's persistent releases - one per
+   (Python, torch) pair, tagged `<component>-<new-ref>-pyX.Y-torch<torch>`
+   (see "Release naming" below and
    `ci/release_meta.py`) - uploads each wheel to its matching release, and
    republishes the index - no tag push needed to make it `pip
    install`-able. The previous ref's releases are left untouched as
@@ -45,7 +45,7 @@ Checklist:
       `max_jobs`, `runs_on`, `arches`, `extra_env`) - follow the schema
       comments already in that file. `wheel_packages` must list every
       distribution the build uploads; push builds use it to detect a complete
-      matching per-Python release. Start with `arches: [x86_64]` and add arm64
+      matching release. Start with `arches: [x86_64]` and add arm64
       later
       (see below). Leave `python_versions` unset to build for every
       interpreter in the matrix (3.11 + 3.12); pin `python_versions: ["3.12"]`
@@ -64,7 +64,7 @@ Checklist:
       `build-<new-component>.yml`; update its `name:`, the `paths:` filter
       entries, and the `--component <name>` argument. The release is
       created inline by `_build.yml` (keyed by the matrix row's
-      `release_tag`, one release per component and Python version), so
+      `release_tag`, one release per component, Python and torch version), so
       there is no per-workflow release job to wire up. Leave the reusable
       workflow calls' structure and the `publish-index` job
       untouched - they're otherwise component-agnostic. Start from
@@ -144,8 +144,7 @@ To add a Python version:
 To build just one interpreter, dispatch with the `python` input (or pass
 `--python <v>` locally); an opted-out component yields an empty matrix and
 its build job is skipped. Each interpreter publishes to its **own** release
-(tag `<component>-<ref>-pyX.Y`, except the legacy 3.12 release, which keeps
-the bare `<component>-<ref>` tag), and its title lists only that
+(tag `<component>-<ref>-pyX.Y-torch<torch>`), and its title lists only that
 interpreter's combos. Adding a version therefore only builds the new
 interpreter's rows; existing interpreters' releases keep their tag/title
 and stay skippable.
@@ -167,22 +166,33 @@ and stay skippable.
 ## Release naming
 
 Each component publishes to its **own** persistent GitHub Release **per
-Python version** (no single combined release for the whole repo). The
-legacy interpreter 3.12 keeps the bare tag `<component>-<ref>`; every
-other interpreter uses `<component>-<ref>-pyX.Y` (e.g.
-`<component>-<ref>-py3.11`). The title is
+(Python version, torch version) pair** (no single combined release for the
+whole repo), tagged `<component>-<ref>-pyX.Y-torch<torch>` (e.g.
+`apex-master-py3.11-torch2.13.0`). The title is
 `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]`
-with one segment per `versions.yaml` `build_matrix` entry **for that
-interpreter** (the `x86_64` arch left implicit), so a 3.11 release lists
-only 3.11 rows. Tag, title, notes and manifest are computed by
-`ci/release_meta.py` - which self-selects the running interpreter after
-`setup-python` when `--python` is not passed - and the release is
+with one segment per `versions.yaml` `build_matrix` entry **for that pair**
+(the `x86_64` arch left implicit), so a 3.11 release lists only 3.11 rows.
+
+Torch is in the tag because the wheel filename does not carry it: two torch
+builds of one ref produce identically-named wheels, so sharing a release
+would make the newer one clobber the older one's assets and silently change
+what already-published download URLs serve. Never collapse the torch
+segment back out of the tag.
+
+Tag, title, notes and manifest are computed by `ci/release_meta.py` - which
+self-selects the running interpreter after `setup-python` when `--python`
+is not passed, and takes the row's torch via `--torch` - and the release is
 created/refreshed inline by `_build.yml` on push builds. Don't hand-roll
 `gh release create`/`edit` calls elsewhere.
-`.github/workflows/_ensure_release.yml` is a legacy, currently uncalled
-helper that only manages 3.12 bare-tag releases. Bumping a component's
-`ref` starts brand-new releases under new tags; it never renames or reuses
-the previous ref's.
+`.github/workflows/_ensure_release.yml` is an uncalled helper kept for
+manual pre-creation. Bumping a component's `ref` (or the matrix's torch)
+starts brand-new releases under new tags; it never renames or reuses the
+previous ones.
+
+The published PEP 503 index is split the same way: `ci/build_index.py`
+writes one tree per CUDA/torch world (`/cu130/torch2.13/simple/`), plus
+`/simple/` as an alias for the world `versions.yaml`'s first `build_matrix`
+row pins.
 
 ## Key invariant
 

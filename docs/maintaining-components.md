@@ -12,7 +12,7 @@ other logic needs to change for routine work.
 |---|---|
 | `versions.yaml` | The version map: arch/CUDA/Python/Torch build matrix + per-component config |
 | `ci/generate_matrix.py` | Expands `versions.yaml` into the GitHub Actions matrix (no edits needed for routine work) |
-| `ci/release_meta.py` | Computes each (component, Python) release's tag/title/notes (no edits needed for routine work) |
+| `ci/release_meta.py` | Computes each (component, Python, torch) release's tag/title/notes (no edits needed for routine work) |
 | `ci/build_scripts/lib/*.sh` | Shared bash leaf helpers; a builder sources only the ones it calls |
 | `ci/build_scripts/provision/install_cudnn.sh` | cuDNN provisioning for `requires_cudnn: true` components |
 | `ci/runner/free_disk_space.sh` | GitHub-hosted disk cleanup; CI-only, never part of the build fingerprint |
@@ -60,11 +60,11 @@ other logic needs to change for routine work.
    wheels' `.nv_fatbin` sections actually cover every SM arch
    `torch_cuda_arch_list` promises. Anything unverifiable (download failure,
    no manifest, old schema) fails closed and rebuilds. Otherwise, on
-   success, that push creates (or reuses) that component's per-Python
-   releases - tag `<component>-<new-ref>` for the legacy 3.12 interpreter
-   and `<component>-<new-ref>-pyX.Y` for every other interpreter, each
-   titled `<component> <new-ref> - cu.. pyX.Y torch..` listing only that
-   interpreter's combos (see `ci/release_meta.py`) - uploads each new wheel
+   success, that push creates (or reuses) that component's releases - one
+   per (Python, torch) pair, tagged
+   `<component>-<new-ref>-pyX.Y-torch<torch>` and titled
+   `<component> <new-ref> - cu.. pyX.Y torch..` listing only that pair's
+   combos (see `ci/release_meta.py`) - uploads each new wheel
    to its matching release, and republishes the package index, so it's
    `pip install`-able right away. Bumping `ref` therefore starts brand-new
    releases; the previous ref's releases are left untouched as history. You
@@ -159,9 +159,9 @@ Worked checklist, using a hypothetical `xformers` component as the example:
    else - `workflow_dispatch`, the reusable `_build.yml` call's structure,
    and the trailing `publish-index` job that runs after a successful push
    build - is component-agnostic and can be copied as-is. `ci/release_meta.py`
-   automatically computes `xformers`'s per-Python release tags/titles (bare
-   `<component>-<ref>` for 3.12, `<component>-<ref>-pyX.Y` otherwise) once
-   its `components:` entry exists in `versions.yaml`.
+   automatically computes `xformers`'s release tags/titles
+   (`<component>-<ref>-pyX.Y-torch<torch>`) once its `components:` entry
+   exists in `versions.yaml`.
 
    If your new component's `runs_on` is **self-hosted**, copy
    `.github/workflows/build-apex.yml` instead: it additionally forwards a
@@ -238,8 +238,10 @@ To turn arm64 on for a component:
    python3 ci/release_meta.py --component <name> --python all
    ```
 
-   (`--python all` prints every per-interpreter release; omit it to
-   self-select the locally running interpreter.)
+   (`--python all` prints every release the component publishes, one per
+   (interpreter, torch) pair; omit it to self-select the locally running
+   interpreter. `--torch` picks the torch version when the matrix builds
+   one interpreter against several.)
 
 6. Smoke-test the new arch on its own before letting a push build both:
    trigger `build-<component>.yml` from the Actions tab and set its **arch**
@@ -316,17 +318,49 @@ To add a Python version:
    `--component megatron-bridge --python 3.11`) is expected; the workflow
    skips its build job via `has_builds`.
 
-Each interpreter gets its **own release**: the interpreter the wheelhouse
-shipped before the split (3.12) keeps the bare `<component>-<ref>` tag, and
-every other interpreter gets `<component>-<ref>-pyX.Y` (see
-`LEGACY_RELEASE_PYTHON` in `ci/generate_matrix.py`); the title lists only
-that interpreter's combos. Adding a Python version therefore never edits
-the existing releases - their tag, title and manifest stay byte-identical
-and their rows keep skipping - while the new interpreter's rows build into
-new `-pyX.Y` releases. Components whose `python_versions` excludes the new
+Each interpreter gets its **own release**, tagged
+`<component>-<ref>-pyX.Y-torch<torch>` (see `release_tag` in
+`ci/generate_matrix.py`), whose title lists only that interpreter's combos.
+Adding a Python version therefore never edits the existing releases - their
+tag, title and manifest stay byte-identical and their rows keep skipping -
+while the new interpreter's rows build into new releases. Components whose `python_versions` excludes the new
 version are not disturbed either, which is exactly why the pure-Python
 components pin it (they must not upload the same `py3-none-any` asset to
 two releases).
+
+## Bumping the matrix's torch version
+
+Torch is the one matrix field that changes *every* component's wheels at
+once, and a compiled CUDA extension is not portable across torch minor
+versions - so a bump is a fork of the whole wheelhouse, not an edit of it.
+
+1. Confirm the trio is publishable: `torch`, `torchvision` and `torchaudio`
+   all have `cp<abi>` `cu<cuda>` wheels for **every** arch/Python row
+   (`pip index versions` against `https://download.pytorch.org/whl/cu130`,
+   or a `curl -sI` on the filename). `versions.yaml`'s header comment
+   records why the current pins are what they are - keep it accurate.
+2. Edit the `torch` / `torch_vision` / `torch_audio` fields of every
+   `build_matrix` row you are moving. Rows can differ: the matrix is a list
+   of independent combinations, so a torch bump can be staged one Python
+   row at a time.
+3. Push. Every component rebuilds (the manifest's `torch` changed, so
+   nothing skips) into **new** releases - the tag carries torch - and the
+   previous torch's releases keep their wheels, their URLs and their place
+   in the index.
+4. `ci/build_index.py` picks the new world up automatically and starts
+   serving it at `/cu<cuda>/torch<major.minor>/simple/`. `/simple/` follows
+   the **first** `build_matrix` row, so it moves to the new torch as soon as
+   that row does: anything that must stay on the old torch has to pin the
+   explicit world URL, not `/simple/`.
+5. Tell downstream. A consumer resolving from `/simple/` (verl pins it in
+   `[[tool.uv.index]]`) silently changes torch world on its next lock;
+   consumers pinning exact release URLs in a lock file keep working, because
+   the bump no longer overwrites those assets.
+
+Historically the tag did *not* carry torch, so step 3 overwrote the previous
+wheels in place. `ci/restore_release_wheels.py` republishes those from the
+build's workflow artifacts (90-day retention) onto the release the current
+scheme gives them, without recompiling.
 
 ## Arch-list conventions
 

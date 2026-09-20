@@ -1,20 +1,23 @@
 name: "~Ensure release"
 
 # Reusable workflow: given one component name (or "all"), creates or
-# updates the LEGACY Python 3.12 GitHub Release(s):
-#   tag:   "<component>-<ref>"              e.g. "transformer-engine-v2.16.1"
+# updates its Python 3.12 GitHub Release(s):
+#   tag:   "<component>-<ref>-py3.12-torch<torch>"
+#          e.g. "transformer-engine-v2.16.1-py3.12-torch2.13.0"
 #   title: "<component> <ref> - cu<cuda> py3.12 torch<torch>[; ...]"
 #          e.g. "transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.13.0"
-# This workflow runs on Python 3.12 and calls ci/release_meta.py without
-# --python, so release_meta self-selects the running interpreter and emits
-# the legacy bare-tag metadata. Releases for every other Python version
-# (tag "<component>-<ref>-pyX.Y", e.g. "transformer-engine-v2.16.1-py3.11")
-# are created inline by _build.yml's "Ensure release" step while uploading
-# (see ci/release_meta.py for the exact computation). A release is created
-# once per (component, ref) pair and reused - and its title kept in sync -
-# across every subsequent build of that same ref; bumping ref in
-# versions.yaml starts a brand new release, leaving the old one attached to
-# the old ref as a historical record.
+# It runs on Python 3.12 and calls ci/release_meta.py without --python or
+# --torch, so release_meta self-selects the running interpreter and the one
+# torch the build_matrix pins for it.
+#
+# NOTHING CALLS THIS. Releases are created inline by _build.yml's "Ensure
+# release" step while uploading, for every (component, Python, torch) the
+# matrix covers; this workflow is kept only as a manual way to pre-create or
+# refresh a 3.12 release without building. A release is created once per
+# (component, ref, Python, torch) and reused - title kept in sync - across
+# every subsequent build of that same combination; bumping ref or torch in
+# versions.yaml starts a brand new release, leaving the old one as a
+# historical record.
 
 on:
   workflow_call:
