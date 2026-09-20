@@ -34,9 +34,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -58,6 +59,27 @@ _ARTIFACT_RE = re.compile(
 def gh_json(*args: str) -> Any:
     result = subprocess.run(["gh", *args], check=True, capture_output=True, text=True)
     return json.loads(result.stdout)
+
+
+def run_with_retries(cmd: List[str], attempts: int = 4) -> None:
+    """Run a gh command, retrying it on failure.
+
+    Artifacts here are multi-GB, and a single read timeout against GitHub's
+    blob backend used to abort the whole restore partway through. Every
+    command this wraps is idempotent (a download into a fresh directory, an
+    upload with --clobber), so retrying is always safe.
+    """
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        reason = detail[-1] if detail else f"exit status {result.returncode}"
+        if attempt == attempts:
+            raise RuntimeError(f"{' '.join(cmd[:3])} failed after {attempts} attempts: {reason}")
+        wait = 5 * attempt
+        print(f"  attempt {attempt}/{attempts} failed ({reason}); retrying in {wait}s", flush=True)
+        time.sleep(wait)
 
 
 def versions_at(ref: str) -> Dict[str, Any]:
@@ -129,53 +151,65 @@ def release_notes(entry: Dict[str, Any], run_ids: List[str]) -> str:
     )
 
 
-def restore(repo: str, tag: str, entry: Dict[str, Any], run_ids: List[str], apply: bool) -> None:
+def released_wheel_count(repo: str, tag: str) -> Optional[int]:
+    """How many .whl assets the release already has, or None if it is absent."""
+    result = subprocess.run(
+        ["gh", "release", "view", tag, "--repo", repo, "--json", "assets"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    assets = json.loads(result.stdout).get("assets", [])
+    return sum(1 for asset in assets if str(asset.get("name", "")).endswith(".whl"))
+
+
+def restore(
+    repo: str, tag: str, entry: Dict[str, Any], run_ids: List[str], apply: bool, force: bool
+) -> bool:
+    """Publish one release from its artifacts. True if anything was uploaded."""
     names = sorted(artifact["name"] for artifact in entry["artifacts"])
-    print(f"{tag}\n  title: {entry['title']}\n  artifacts: {', '.join(names)}")
+    print(f"{tag}\n  title: {entry['title']}\n  artifacts: {', '.join(names)}", flush=True)
     if not apply:
-        return
+        return False
+
+    # Each artifact holds one wheel, so a release already carrying that many
+    # is done. Re-running after a failure (these downloads are multi-GB and
+    # the network is not always kind) then costs nothing for what succeeded.
+    if not force:
+        existing = released_wheel_count(repo, tag)
+        if existing is not None and existing >= len(entry["artifacts"]):
+            print(f"  already has {existing} wheel(s); skipping (use --force to redo)")
+            return False
 
     with tempfile.TemporaryDirectory(prefix="wheelhouse-restore-") as tmp:
         dest = Path(tmp)
         for artifact in entry["artifacts"]:
-            subprocess.run(
+            run_with_retries(
                 [
                     "gh", "run", "download", artifact["run_id"],
                     "--repo", repo,
                     "--name", artifact["name"],
                     "--dir", str(dest / artifact["name"]),
-                ],
-                check=True,
+                ]
             )
         wheels = sorted(dest.rglob("*.whl"))
         if not wheels:
-            raise SystemExit(f"{tag}: artifacts contained no .whl files")
+            raise RuntimeError(f"{tag}: artifacts contained no .whl files")
 
-        exists = subprocess.run(
-            ["gh", "release", "view", tag, "--repo", repo],
-            capture_output=True,
-            text=True,
-        ).returncode == 0
         notes_file = dest / "notes.md"
         notes_file.write_text(release_notes(entry, run_ids), encoding="utf-8")
-        if exists:
-            subprocess.run(
-                ["gh", "release", "edit", tag, "--repo", repo,
-                 "--title", entry["title"], "--notes-file", str(notes_file)],
-                check=True,
-            )
-        else:
-            subprocess.run(
-                ["gh", "release", "create", tag, "--repo", repo,
-                 "--title", entry["title"], "--notes-file", str(notes_file)],
-                check=True,
-            )
-        subprocess.run(
-            ["gh", "release", "upload", tag, *[str(path) for path in wheels],
-             "--repo", repo, "--clobber"],
-            check=True,
+        verb = "edit" if released_wheel_count(repo, tag) is not None else "create"
+        run_with_retries(
+            ["gh", "release", verb, tag, "--repo", repo,
+             "--title", entry["title"], "--notes-file", str(notes_file)]
         )
-        print(f"  uploaded {len(wheels)} wheel(s)")
+        run_with_retries(
+            ["gh", "release", "upload", tag, *[str(path) for path in wheels],
+             "--repo", repo, "--clobber"]
+        )
+        print(f"  uploaded {len(wheels)} wheel(s)", flush=True)
+        return True
 
 
 def main() -> None:
@@ -209,6 +243,11 @@ def main() -> None:
         action="store_true",
         help="Actually download and publish. Without it the plan is printed only.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download and re-upload releases that already carry their wheels.",
+    )
     args = parser.parse_args()
 
     versions = versions_at(args.versions_ref)
@@ -218,13 +257,25 @@ def main() -> None:
             f"No unexpired artifacts for torch {args.torch} in run(s) {', '.join(args.runs)}."
         )
 
+    # One release failing (a read timeout on a multi-GB artifact, most
+    # likely) must not strand the ones after it: keep going and report at the
+    # end, so a re-run only has the failures left to do.
+    restored, failures = 0, []
     for tag in sorted(plan):
-        restore(args.repo, tag, plan[tag], args.runs, args.apply)
+        try:
+            if restore(args.repo, tag, plan[tag], args.runs, args.apply, args.force):
+                restored += 1
+        except RuntimeError as exc:
+            print(f"  FAILED: {exc}", file=sys.stderr, flush=True)
+            failures.append(tag)
 
     if not args.apply:
         print(f"\nDry run: {len(plan)} release(s) would be restored. Re-run with --apply.")
-    else:
-        print(f"\nRestored {len(plan)} release(s).")
+        return
+    print(f"\nRestored {restored} release(s) of {len(plan)} planned.")
+    if failures:
+        print(f"Failed: {', '.join(failures)}. Re-run to retry just those.", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
