@@ -15,13 +15,19 @@ import release_meta
 from test_cuda_archs import fatbin_elf, make_wheel
 
 
+# Torch every fixture matrix below pins. Its value is arbitrary (these tests
+# never touch a real wheel), but releases are keyed by it, so helpers and tag
+# assertions have to agree on one.
+DEMO_TORCH = "2.11.0"
+
+
 def make_versions(component):
     return {
         "build_matrix": [
             {
                 "cuda": "13.0.2",
                 "python": "3.12",
-                "torch": "2.11.0",
+                "torch": DEMO_TORCH,
                 "torch_vision": "0.26.0",
                 "torch_audio": "2.11.0",
                 "cxx11_abi": "TRUE",
@@ -31,19 +37,19 @@ def make_versions(component):
     }
 
 
-def make_release(versions, assets, python="3.12"):
+def make_release(versions, assets, python="3.12", torch=DEMO_TORCH):
     """A release dict whose title/notes are computed the way release_meta.py
-    computes them for one (component, Python) release, so the hidden body
-    manifest matches versions.yaml exactly."""
+    computes them for one (component, Python, torch) release, so the hidden
+    body manifest matches versions.yaml exactly."""
     cfg = versions["components"]["demo"]
     ref = str(cfg["ref"])
     return {
         "name": generate_matrix.release_title(
             ref,
             "demo",
-            generate_matrix.component_combos_for_python(versions, "demo", python),
+            generate_matrix.component_combos_for_release(versions, "demo", python, torch),
         ),
-        "body": generate_matrix.format_release_notes(versions, "demo", python),
+        "body": generate_matrix.format_release_notes(versions, "demo", python, torch),
         "assets": [{"name": name, "size": size} for name, size in assets],
     }
 
@@ -76,14 +82,14 @@ class ExistingReleaseTests(unittest.TestCase):
 
     def test_exact_release_covers_component(self) -> None:
         covered, _ = generate_matrix.release_covers_component(
-            self.versions, "demo", "3.12", self.release
+            self.versions, "demo", "3.12", DEMO_TORCH, self.release
         )
         self.assertTrue(covered)
 
     def test_dependency_title_must_match_exactly(self) -> None:
         self.release["name"] = "demo v1.2.3 - cu12.8.1 py3.12 torch2.11.0"
         covered, reason = generate_matrix.release_covers_component(
-            self.versions, "demo", "3.12", self.release
+            self.versions, "demo", "3.12", DEMO_TORCH, self.release
         )
         self.assertFalse(covered)
         self.assertIn("title mismatch", reason)
@@ -91,7 +97,7 @@ class ExistingReleaseTests(unittest.TestCase):
     def test_every_expected_wheel_package_is_required(self) -> None:
         self.release["assets"].pop()
         covered, reason = generate_matrix.release_covers_component(
-            self.versions, "demo", "3.12", self.release
+            self.versions, "demo", "3.12", DEMO_TORCH, self.release
         )
         self.assertFalse(covered)
         self.assertIn("demo-helper", reason)
@@ -99,7 +105,7 @@ class ExistingReleaseTests(unittest.TestCase):
     def test_missing_manifest_forces_rebuild(self) -> None:
         self.release["body"] = "human notes only, no snapshot"
         covered, reason = generate_matrix.release_covers_component(
-            self.versions, "demo", "3.12", self.release
+            self.versions, "demo", "3.12", DEMO_TORCH, self.release
         )
         self.assertFalse(covered)
         self.assertIn("no stored build config", reason)
@@ -111,7 +117,9 @@ class ExistingReleaseTests(unittest.TestCase):
             self.versions, ["demo"], "owner/repo"
         )
         self.assertEqual([], needed)
-        inspect_release.assert_called_once_with("owner/repo", "demo-v1.2.3")
+        inspect_release.assert_called_once_with(
+            "owner/repo", f"demo-v1.2.3-py3.12-torch{DEMO_TORCH}"
+        )
 
     @patch("generate_matrix.inspect_release")
     def test_detection_failure_keeps_build(self, inspect_release) -> None:
@@ -265,7 +273,9 @@ class BuildConfigManifestTests(unittest.TestCase):
         # snapshot at all: the asset must be downloaded and used.
         release, wheel_name, fake_download = self._release_with_wheel(["8.0", "9.0", "10.0"])
         manifest_blob = json.dumps(
-            generate_matrix.component_build_manifest(self.versions, "demo", "3.12"),
+            generate_matrix.component_build_manifest(
+                self.versions, "demo", "3.12", DEMO_TORCH
+            ),
             indent=2,
             sort_keys=True,
         )
@@ -724,7 +734,7 @@ def make_python_matrix_versions(component_cfg, arches=("x86_64", "aarch64"),
                 "arch": arch,
                 "cuda": "13.0.2",
                 "python": python,
-                "torch": "2.11.0",
+                "torch": DEMO_TORCH,
                 "torch_vision": "0.26.0",
                 "torch_audio": "2.11.0",
                 "cxx11_abi": "TRUE",
@@ -853,8 +863,9 @@ class PythonVersionFilterTests(unittest.TestCase):
 
 
 class PerPythonReleaseTests(unittest.TestCase):
-    """One GitHub Release per (component, Python version): the legacy 3.12
-    release keeps its bare tag/title, while 3.11 gets separate new releases."""
+    """One GitHub Release per (component, Python version, torch version):
+    each interpreter's rows get their own tag, title and manifest, and a
+    torch bump lands on a new release instead of overwriting the old one."""
 
     PY312_WHEELS = [
         ("demo-1.2.3-cp312-cp312-manylinux_2_28_x86_64.whl", 1000),
@@ -887,18 +898,41 @@ class PerPythonReleaseTests(unittest.TestCase):
         self.versions = make_python_matrix_versions(dict(self.cfg))
         self.entries = generate_matrix.build_full_matrix(self.versions, ["demo"])
 
-    def test_legacy_python_keeps_bare_tag(self) -> None:
+    def test_tag_spells_out_python_and_torch(self) -> None:
         tags = {(r["arch"], r["python"]): r["release_tag"] for r in self.entries}
-        self.assertEqual("demo-v1.2.3", tags[("x86_64", "3.12")])
-        self.assertEqual("demo-v1.2.3", tags[("aarch64", "3.12")])
-        self.assertEqual("demo-v1.2.3-py3.11", tags[("x86_64", "3.11")])
-        self.assertEqual("demo-v1.2.3-py3.11", tags[("aarch64", "3.11")])
+        self.assertEqual(f"demo-v1.2.3-py3.12-torch{DEMO_TORCH}", tags[("x86_64", "3.12")])
+        self.assertEqual(f"demo-v1.2.3-py3.12-torch{DEMO_TORCH}", tags[("aarch64", "3.12")])
+        self.assertEqual(f"demo-v1.2.3-py3.11-torch{DEMO_TORCH}", tags[("x86_64", "3.11")])
+        self.assertEqual(f"demo-v1.2.3-py3.11-torch{DEMO_TORCH}", tags[("aarch64", "3.11")])
+        # Both arches of one interpreter share a release; the wheel filename's
+        # platform tag is what tells them apart inside it.
+        self.assertEqual(2, len(set(tags.values())))
+
+    def test_two_torch_versions_never_share_a_release(self) -> None:
+        """A matrix building one interpreter against two torch versions must
+        produce two releases - otherwise the second build's wheels overwrite
+        the first's, since neither version is in the wheel filename."""
+        versions = make_python_matrix_versions(dict(self.cfg), pythons=("3.12",))
+        newer = dict(versions["build_matrix"][0], torch="2.13.0")
+        versions["build_matrix"].append(newer)
+
+        self.assertEqual(
+            [("3.12", DEMO_TORCH), ("3.12", "2.13.0")],
+            generate_matrix.component_release_keys(versions, "demo"),
+        )
+        tags = {r["release_tag"] for r in generate_matrix.build_full_matrix(versions, ["demo"])}
+        self.assertEqual(
+            {f"demo-v1.2.3-py3.12-torch{DEMO_TORCH}", "demo-v1.2.3-py3.12-torch2.13.0"},
+            tags,
+        )
 
     def test_release_title_lists_only_that_python_segments(self) -> None:
         title312 = generate_matrix.release_title(
             "v1.2.3",
             "demo",
-            generate_matrix.component_combos_for_python(self.versions, "demo", "3.12"),
+            generate_matrix.component_combos_for_release(
+                self.versions, "demo", "3.12", DEMO_TORCH
+            ),
         )
         self.assertEqual(
             "demo v1.2.3 - cu13.0.2 py3.12 torch2.11.0; "
@@ -908,7 +942,9 @@ class PerPythonReleaseTests(unittest.TestCase):
         title311 = generate_matrix.release_title(
             "v1.2.3",
             "demo",
-            generate_matrix.component_combos_for_python(self.versions, "demo", "3.11"),
+            generate_matrix.component_combos_for_release(
+                self.versions, "demo", "3.11", DEMO_TORCH
+            ),
         )
         self.assertEqual(
             "demo v1.2.3 - cu13.0.2 py3.11 torch2.11.0; "
@@ -919,7 +955,7 @@ class PerPythonReleaseTests(unittest.TestCase):
     def test_manifest_is_scoped_to_one_python(self) -> None:
         for python in ("3.11", "3.12"):
             manifest = generate_matrix.component_build_manifest(
-                self.versions, "demo", python
+                self.versions, "demo", python, DEMO_TORCH
             )
             self.assertEqual(python, manifest["python"])
             self.assertEqual(2, len(manifest["builds"]))
@@ -930,11 +966,12 @@ class PerPythonReleaseTests(unittest.TestCase):
         self, inspect_release
     ) -> None:
         release312 = make_release(self.versions, self.PY312_WHEELS, python="3.12")
+        tag312 = f"demo-v1.2.3-py3.12-torch{DEMO_TORCH}"
         seen_tags = []
 
         def fake_inspect(_repo, tag):
             seen_tags.append(tag)
-            return release312 if tag == "demo-v1.2.3" else None
+            return release312 if tag == tag312 else None
 
         inspect_release.side_effect = fake_inspect
         decisions = generate_matrix.evaluate_matrix_rows(
@@ -949,13 +986,13 @@ class PerPythonReleaseTests(unittest.TestCase):
         # Each per-python release is inspected once, shared by both arch rows.
         self.assertEqual(2, inspect_release.call_count)
         self.assertEqual(
-            ["demo-v1.2.3", "demo-v1.2.3-py3.11"], sorted(seen_tags)
+            [f"demo-v1.2.3-py3.11-torch{DEMO_TORCH}", tag312], sorted(seen_tags)
         )
 
     def test_one_python_release_never_covers_the_other_python_row(self) -> None:
         release311 = make_release(self.versions, self.PY311_WHEELS, python="3.11")
-        combo312 = generate_matrix.component_combos_for_python(
-            self.versions, "demo", "3.12"
+        combo312 = generate_matrix.component_combos_for_release(
+            self.versions, "demo", "3.12", DEMO_TORCH
         )[0]
         covered, reason = generate_matrix.release_covers_combo(
             self.versions, "demo", combo312, release311, repo=None, verify_wheels=False
@@ -965,15 +1002,33 @@ class PerPythonReleaseTests(unittest.TestCase):
 
     def test_release_meta_explicit_python(self) -> None:
         meta = release_meta.component_release_meta(self.versions, "demo", "3.11")
-        self.assertEqual("demo-v1.2.3-py3.11", meta["tag"])
+        self.assertEqual(f"demo-v1.2.3-py3.11-torch{DEMO_TORCH}", meta["tag"])
         self.assertEqual("3.11", meta["python"])
+        self.assertEqual(DEMO_TORCH, meta["torch"])
         self.assertIn("py3.11", meta["title"])
         self.assertEqual(2, len(meta["manifest"]["builds"]))
+
+    def test_release_meta_infers_torch_from_the_matrix(self) -> None:
+        """_build.yml passes --torch, but a caller that omits it still gets the
+        right release as long as the interpreter pins exactly one torch."""
+        self.assertEqual(
+            DEMO_TORCH,
+            release_meta.resolve_torch(self.versions, "demo", "3.12", None),
+        )
+        self.versions["build_matrix"].append(
+            dict(self.versions["build_matrix"][0], python="3.12", torch="2.13.0")
+        )
+        with self.assertRaises(SystemExit):
+            release_meta.resolve_torch(self.versions, "demo", "3.12", None)
+        self.assertEqual(
+            "2.13.0",
+            release_meta.resolve_torch(self.versions, "demo", "3.12", "2.13.0"),
+        )
 
     def test_release_meta_all_emits_one_record_per_opted_in_python(self) -> None:
         entries = release_meta.release_meta_entries(self.versions, ["demo"], "all")
         self.assertEqual(
-            ["demo-v1.2.3-py3.11", "demo-v1.2.3"],
+            [f"demo-v1.2.3-py3.11-torch{DEMO_TORCH}", f"demo-v1.2.3-py3.12-torch{DEMO_TORCH}"],
             [entry["tag"] for entry in entries],
         )
 
@@ -988,13 +1043,18 @@ class PerPythonReleaseTests(unittest.TestCase):
             self.versions, ["demo", "bridge"], "3.11"
         )
         self.assertEqual(
-            ["demo-v1.2.3-py3.11"], [entry["tag"] for entry in entries311]
+            [f"demo-v1.2.3-py3.11-torch{DEMO_TORCH}"],
+            [entry["tag"] for entry in entries311],
         )
         entries_all = release_meta.release_meta_entries(
             self.versions, ["demo", "bridge"], "all"
         )
         self.assertEqual(
-            ["demo-v1.2.3-py3.11", "demo-v1.2.3", "bridge-v9.9.9"],
+            [
+                f"demo-v1.2.3-py3.11-torch{DEMO_TORCH}",
+                f"demo-v1.2.3-py3.12-torch{DEMO_TORCH}",
+                f"bridge-v9.9.9-py3.12-torch{DEMO_TORCH}",
+            ],
             [entry["tag"] for entry in entries_all],
         )
 

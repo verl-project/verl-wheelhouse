@@ -2,45 +2,45 @@
 """Compute GitHub Release metadata (tag/title/notes) for one or every
 component in versions.yaml.
 
-Each (component, Python version) pair gets its own persistent GitHub
-Release, keyed by the component's currently-pinned ref:
+Each (component, Python version, torch version) triple gets its own
+persistent GitHub Release, keyed by the component's currently-pinned ref:
 
-    tag:   "<component>-<ref>"          e.g. "transformer-engine-v2.16.1"
-           (the legacy interpreter - LEGACY_RELEASE_PYTHON, the only one
-           the wheelhouse shipped before per-Python releases - keeps this
-           bare tag so releases already on GitHub keep their identity and
-           their skip detection)
-           "<component>-<ref>-pyX.Y"    e.g. "apex-master-py3.11"
-           (every other interpreter gets its own suffixed release, so
-           adding a Python version creates releases instead of changing
-           the existing ones)
+    tag:   "<component>-<ref>-pyX.Y-torch<torch>"
+           e.g. "apex-master-py3.12-torch2.13.0"
+           (both versions are in the tag because the wheel is ABI-bound to
+           each and its filename records neither: sharing a tag across torch
+           versions would make the newer build clobber the older one's
+           assets, silently changing what every pinned download URL serves)
     title: "<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]"
            (one segment per versions.yaml build_matrix row of that
-           component *for that Python only*, with the x86_64 arch left
-           implicit) e.g.
+           component *for that Python and torch only*, with the x86_64 arch
+           left implicit) e.g.
            "apex master - cu13.0.2 py3.11 torch2.13.0; aarch64 cu13.0.2 py3.11 torch2.13.0"
     notes: human-readable pin plus a hidden JSON snapshot of each wheel's
            build config (CUDA/Python/Torch, torch_cuda_arch_list, extra_env,
            builder, ...). Skip detection requires that snapshot to match
            versions.yaml exactly; title and wheel filename stay free of GPU arch.
 
-Rebuilding the same ref re-uploads (--clobber) wheels onto the same
-per-Python release; bumping a component's ref in versions.yaml starts a
-brand new set of releases (new tags), leaving the previous one attached
-to the old ref as a historical record. This module reuses
+Rebuilding the same (ref, Python, torch) re-uploads (--clobber) wheels onto
+the same release; bumping a component's ref - or the matrix's torch - starts
+a brand new set of releases (new tags), leaving the previous ones attached to
+the old versions as a historical record. This module reuses
 generate_matrix.py's helpers so the tag computed here always matches the
 "release_tag" field _build.yml is given for that matrix row.
 
 With no --python, the running interpreter's major.minor selects the
 release: _build.yml runs this after setup-python has put the matrix row's
-Python on PATH, so the correct per-Python metadata is computed without
-another workflow input. --python X.Y selects one interpreter explicitly;
---python all emits one entry per (component, interpreter the component
-opts into).
+Python on PATH, so the correct metadata is computed without another workflow
+input. --python X.Y selects one interpreter explicitly; --python all emits
+one entry per (component, interpreter the component opts into). --torch
+likewise pins the torch version; when omitted it is inferred from the
+build_matrix rows of the selected interpreter, which normally pin exactly
+one.
 
 Usage:
     python ci/release_meta.py --component apex
     python ci/release_meta.py --component apex --python 3.11
+    python ci/release_meta.py --component apex --torch 2.13.0
     python ci/release_meta.py --component all --python all
     python ci/release_meta.py --component apex --github-output
 """
@@ -51,14 +51,16 @@ import argparse
 import json
 import os
 import platform
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from generate_matrix import (
     BUILD_MANIFEST_FILENAME,
     component_build_manifest,
-    component_combos_for_python,
+    component_combos_for_release,
     component_names,
     component_python_versions,
+    component_release_keys,
+    component_torch_versions,
     format_release_notes,
     get_component,
     load_versions,
@@ -73,51 +75,78 @@ def runtime_python() -> str:
     return ".".join(platform.python_version().split(".")[:2])
 
 
+def resolve_torch(
+    versions: Dict[str, Any], component: str, python: str, torch: Optional[str]
+) -> str:
+    """The torch version a release is for, inferred when not given explicitly."""
+    available = component_torch_versions(versions, component, python)
+    if torch is not None:
+        if str(torch) not in available:
+            raise SystemExit(
+                f"Component {component!r} does not build Python {python} against torch "
+                f"{torch}. It builds: {', '.join(available) or '(nothing)'}."
+            )
+        return str(torch)
+    if len(available) != 1:
+        raise SystemExit(
+            f"Component {component!r} builds Python {python} against "
+            f"{len(available)} torch versions ({', '.join(available) or 'none'}); "
+            "pass --torch to pick one."
+        )
+    return available[0]
+
+
 def component_release_meta(
-    versions: Dict[str, Any], component: str, python: str
+    versions: Dict[str, Any], component: str, python: str, torch: Optional[str] = None
 ) -> Dict[str, Any]:
     cfg = get_component(versions, component)
     ref = str(cfg["ref"])
-    combos = component_combos_for_python(versions, component, python)
-    if not combos:
+    if not component_torch_versions(versions, component, python):
         available = ", ".join(component_python_versions(versions, component))
         raise SystemExit(
             f"Component {component!r} has no build_matrix rows for Python {python}. "
             f"It builds for: {available or '(nothing)'}."
         )
+    torch = resolve_torch(versions, component, python, torch)
+    combos = component_combos_for_release(versions, component, python, torch)
     return {
         "component": component,
         "python": str(python),
+        "torch": torch,
         "ref": ref,
-        "tag": release_tag(component, ref, python),
+        "tag": release_tag(component, ref, python, torch),
         "title": release_title(ref, component, combos),
-        "notes": format_release_notes(versions, component, python),
+        "notes": format_release_notes(versions, component, python, torch),
         # Machine-readable build snapshot uploaded as a release asset
         # (BUILD_MANIFEST_FILENAME); the notes above embed the same JSON as a
         # fallback for older skip-detection code.
-        "manifest": component_build_manifest(versions, component, python),
+        "manifest": component_build_manifest(versions, component, python, torch),
         "manifest_asset": BUILD_MANIFEST_FILENAME,
     }
 
 
 def release_meta_entries(
-    versions: Dict[str, Any], components: List[str], python: str
+    versions: Dict[str, Any],
+    components: List[str],
+    python: str,
+    torch: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """One metadata record per (component, Python) pair.
+    """One metadata record per release the given components publish.
 
     With python == "all" every component contributes one record per
-    interpreter it opts into; otherwise components that don't opt into that
-    interpreter are skipped (an explicitly named such component is rejected
-    by main() before reaching here).
+    (interpreter, torch) pair it opts into; otherwise components that don't
+    opt into that interpreter are skipped (an explicitly named such
+    component is rejected by main() before reaching here).
     """
     if python == "all":
         return [
-            component_release_meta(versions, name, py)
+            component_release_meta(versions, name, py, release_torch)
             for name in components
-            for py in component_python_versions(versions, name)
+            for py, release_torch in component_release_keys(versions, name)
+            if torch is None or release_torch == torch
         ]
     return [
-        component_release_meta(versions, name, python)
+        component_release_meta(versions, name, python, torch)
         for name in components
         if python in component_python_versions(versions, name)
     ]
@@ -137,6 +166,16 @@ def main() -> None:
             "Python version the release is for (e.g. 3.11), or 'all' for every "
             "interpreter each component opts into. Defaults to the running "
             "interpreter's major.minor (CI: the matrix row's setup-python)."
+        ),
+    )
+    parser.add_argument(
+        "--torch",
+        default=None,
+        help=(
+            "Torch version the release is for (e.g. 2.13.0). Defaults to the one "
+            "the build_matrix pins for the selected interpreter, which is "
+            "unambiguous unless the matrix builds that interpreter against "
+            "several torch versions."
         ),
     )
     parser.add_argument(
@@ -171,7 +210,7 @@ def main() -> None:
                 f"It builds for: {available or '(nothing)'}."
             )
 
-    entries = release_meta_entries(versions, components, python)
+    entries = release_meta_entries(versions, components, python, args.torch)
     payload = json.dumps(entries)
     print(payload)
 

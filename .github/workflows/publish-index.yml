@@ -29,6 +29,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # build_index reads versions.yaml (through generate_matrix) to decide
+      # which CUDA/torch world /simple/ aliases.
+      - run: pip install pyyaml
+
       - name: Generate PEP 503 index
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

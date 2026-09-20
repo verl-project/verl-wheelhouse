@@ -28,13 +28,12 @@ GitHub-hosted runners (disk cleanup, swap space, capped parallelism,
 resumable build caches).
 
 Wheels are published to [GitHub Releases](../../releases) - one persistent
-release per component and Python version, named after that component and its
-pinned dependency versions (e.g. the 3.12 release
+release per component, Python version and torch version, named after that
+component and its pinned dependency versions (e.g.
 `transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.13.0`, tag
-`transformer-engine-v2.16.1`; the 3.11 wheels live on the separate
-`transformer-engine-v2.16.1-py3.11` release) - and to a static
-[GitHub Pages](https://pages.github.com/) PEP 503 "simple" package index, so
-they're directly `pip install`-able.
+`transformer-engine-v2.16.1-py3.12-torch2.13.0`) - and to static
+[GitHub Pages](https://pages.github.com/) PEP 503 "simple" package indexes,
+one per CUDA/torch combination, so they're directly `pip install`-able.
 
 ## Repo layout
 
@@ -42,8 +41,10 @@ they're directly `pip install`-able.
 versions.yaml             # THE editable/extendable version map (see below), kept in the project's base dir
 ci/
   generate_matrix.py      # expands versions.yaml into a GH Actions matrix
-  release_meta.py          # release tag/title/notes per component x Python
-  build_index.py          # builds the static PEP 503 index from release assets
+  release_meta.py          # release tag/title/notes per component x Python x torch
+  build_index.py          # builds the per-CUDA/torch PEP 503 indexes from release assets
+  migrate_release_tags.py # one-time: retag releases to the per-torch scheme
+  restore_release_wheels.py # one-time: republish clobbered wheels from build artifacts
   build_scripts/
     apex.sh
     transformer_engine.sh
@@ -63,7 +64,7 @@ ci/
     enable_deep_ep_sm80.py  # fat-bin Ampere+Hopper for deep-ep
 .github/workflows/
   _build.yml              # reusable single-combination build workflow
-  _ensure_release.yml     # legacy helper: create/update 3.12 bare-tag releases
+  _ensure_release.yml     # unused helper: pre-create/refresh a release (releases are made inline by _build.yml)
   build-apex.yml
   build-transformer-engine.yml
   build-flash-attention.yml
@@ -130,43 +131,49 @@ python3 ci/generate_matrix.py --component apex | python3 -m json.tool
 python3 ci/generate_matrix.py --component all
 ```
 
-## Releases: one persistent release per component and Python version
+## Releases: one persistent release per component, Python and torch
 
-Every component gets **its own GitHub Release for each Python version it
-builds for** - there is no single combined release for "the repo" as a whole,
-and the interpreters never share a release. `ci/release_meta.py` computes,
-for a component, one Python version and its currently-pinned `ref` in
-`versions.yaml`:
+Every component gets **its own GitHub Release for each (Python version,
+torch version) pair it builds for** - there is no single combined release
+for "the repo" as a whole. `ci/release_meta.py` computes, for such a triple
+and the component's currently-pinned `ref` in `versions.yaml`:
 
-- **tag**: `<component>-<ref>` for the interpreter the wheelhouse shipped
-  before per-Python releases (currently 3.12, the *legacy* tag, kept stable
-  so releases already on GitHub keep their identity and skip detection), and
-  `<component>-<ref>-pyX.Y` for every other interpreter, e.g.
-  `transformer-engine-v2.16.1-py3.11`
+- **tag**: `<component>-<ref>-pyX.Y-torch<torch>`, e.g.
+  `transformer-engine-v2.16.1-py3.11-torch2.13.0`
 - **title**: `<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>[; ...]`
-  with one segment per `build_matrix` row **of that Python version** and the
-  `x86_64` arch left implicit, e.g. `apex master - cu13.0.2 py3.11
+  with one segment per `build_matrix` row **of that Python and torch** and
+  the `x86_64` arch left implicit, e.g. `apex master - cu13.0.2 py3.11
   torch2.13.0; aarch64 cu13.0.2 py3.11 torch2.13.0`
 
-Splitting releases per interpreter means adding a Python version creates
-new releases instead of editing existing ones: the new `cp<abi>` wheels go
-to the new `-pyX.Y` release, while the older interpreters' releases keep
-their exact tag/title/manifest and stay skippable (no churn rebuild). The
-wheels cannot collide across releases because their filenames carry
-`cp311`/`cp312` tags, and the PEP 503 index enumerates every release
-regardless of tag.
+Both versions are in the tag because a wheel is ABI-bound to each and its
+filename records neither: `apex-0.1-cp312-cp312-linux_x86_64.whl` is the
+name a torch 2.11 build and a torch 2.13 build both produce. Sharing one
+tag across torch versions therefore meant the newer build silently
+overwrote the older one's assets - changing what every already-published
+download URL (including the ones pinned in a `uv.lock`) serves, with no
+version or hash to notice it by. Arch stays *inside* a release, because
+there the wheel filename's platform tag does distinguish the files.
+
+Adding a Python or torch version now creates new releases instead of
+editing existing ones: the new wheels go to the new tag, while the older
+releases keep their exact tag/title/manifest and stay skippable (no churn
+rebuild) and installable.
 
 The build workflow creates the release inline while uploading: `_build.yml`
 runs `ci/release_meta.py` under the matrix row's own setup-python
-interpreter, so it computes that row's tag/title without an extra workflow
-input (no `--python` is passed). The reusable
-`.github/workflows/_ensure_release.yml` workflow is a standalone way to
-pre-create or refresh the legacy 3.12 releases (it runs under Python 3.12
-and therefore self-selects the bare-tag metadata). Rebuilding the same
-`ref` re-uploads (`--clobber`) wheels onto that same release; bumping a
-component's `ref` in `versions.yaml` starts **brand-new** releases under new
-tags, leaving the previous releases (and their wheels) attached to the old
-`ref` untouched as a historical record.
+interpreter, so the interpreter needs no workflow input (no `--python` is
+passed); torch has no such ambient source and is passed as `--torch`.
+Rebuilding the same triple re-uploads (`--clobber`) wheels onto that same
+release; bumping a component's `ref` - or the matrix's torch - starts
+**brand-new** releases under new tags, leaving the previous releases (and
+their wheels) untouched as a historical record.
+
+Two one-time maintenance scripts exist for the migration to this scheme:
+`ci/migrate_release_tags.py` retags releases created under the older
+(component, Python) scheme, and `ci/restore_release_wheels.py` republishes
+wheels that a torch bump overwrote back onto their own release, reading
+them from the build's still-retained workflow artifacts. Both default to a
+dry run and take `--apply` to act.
 
 ## Triggering builds
 
@@ -219,23 +226,33 @@ tags, leaving the previous releases (and their wheels) attached to the old
 
 ## Installing built wheels
 
-The index is published to GitHub Pages at
-<https://verl-project.github.io/verl-wheelhouse/simple/>, and is refreshed
-whenever a wheel lands on one of a component's releases (from a `main` push
-or a `release.yml` sweep):
+Indexes are published to GitHub Pages **per CUDA/torch world**, and
+refreshed whenever a wheel lands on one of a component's releases (from a
+`main` push or a `release.yml` sweep):
 
 ```bash
-pip install --extra-index-url https://verl-project.github.io/verl-wheelhouse/simple/ flash-attn
+# Pin the world matching your environment (recommended):
+pip install --extra-index-url https://verl-project.github.io/verl-wheelhouse/cu130/torch2.13/simple/ flash-attn
+
+# /simple/ is an alias for whatever versions.yaml currently builds, so it
+# moves to the next torch when the matrix does:
 pip install --extra-index-url https://verl-project.github.io/verl-wheelhouse/simple/ transformer-engine
 ```
 
-Or install a specific wheel directly from that component's
-[release page](../../releases) - look for the tag `<component>-<ref>` on
-the legacy 3.12 release (e.g. `transformer-engine-v2.16.1`) or
-`<component>-<ref>-pyX.Y` for other interpreters (e.g.
-`transformer-engine-v2.16.1-py3.11`).
+The split is not cosmetic: a wheel built against torch 2.11 and one built
+against torch 2.13 have the same filename *and* the same version, so one
+index cannot hold both and nothing in a plain `pip install apex` could
+express which you need. Picking the URL is what makes the choice explicit -
+the same shape `download.pytorch.org/whl/cu130` and `flashinfer.ai/whl/cu130/torch2.13`
+use. [`../../releases`](../../releases) lists every world's releases; their
+landing page at the Pages root enumerates the ones currently published.
 
-On a fork, substitute your own `https://<owner>.github.io/<repo>/simple/`
+Or install a specific wheel directly from that component's
+[release page](../../releases) - look for the tag
+`<component>-<ref>-pyX.Y-torch<torch>` (e.g.
+`transformer-engine-v2.16.1-py3.11-torch2.13.0`).
+
+On a fork, substitute your own `https://<owner>.github.io/<repo>/`
 and enable Pages first (Settings → Pages → Source: GitHub Actions);
 everything in `ci/` and `.github/workflows/` derives the repo it is running
 in from `${{ github.repository }}`, so no other change is needed.

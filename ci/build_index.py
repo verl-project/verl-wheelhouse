@@ -1,11 +1,28 @@
 #!/usr/bin/env python3
-"""Build a static PEP 503 "simple" package index from this repo's GitHub
+"""Build static PEP 503 "simple" package indexes from this repo's GitHub
 Release assets, for deployment to GitHub Pages.
 
 Every .whl attached to any GitHub Release in the repo is listed under its
 (PEP 503-normalized) distribution name, linking straight back to the release
 asset's own download URL - GitHub Pages only ever serves the tiny index
 HTML, never the wheel bytes themselves.
+
+One index is published per CUDA/torch world the releases cover:
+
+    /cu130/torch2.13/simple/   every wheel built against cu13.0.2 + torch 2.13
+    /cu130/torch2.11/simple/   ... and the ones still on torch 2.11
+    /simple/                   alias for the build_matrix's current default
+
+The split exists because a wheel filename records neither CUDA nor torch,
+so two torch builds of the same component produce byte-different wheels with
+identical names and versions. A single index could not hold both, and a
+consumer resolving from it would have no way to ask for the build matching
+its own torch; a per-world index URL makes that choice explicit and
+unambiguous - the same shape download.pytorch.org and flashinfer.ai use.
+
+Which world a release belongs to is read from its title, which
+ci/release_meta.py generates with a "cu<cuda> py<python> torch<torch>"
+segment per build.
 
 Usage:
     python ci/build_index.py --repo <owner>/<repo> --out-dir _site
@@ -26,15 +43,58 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, TypedDict
 
+from generate_matrix import load_versions
+
 
 class WheelAsset(TypedDict):
     name: str
     url: str
+    worlds: List[str]
+
+
+# "cu13.0.2 py3.12 torch2.13.0" segments of a release title (see
+# ci/release_meta.py's release_title). One per build the release covers;
+# under the current tag scheme they all agree on CUDA and torch and differ
+# only by arch, but parsing every segment keeps older multi-world titles
+# (and hand-made ones) from landing in the wrong index.
+_TITLE_SEGMENT_RE = re.compile(r"cu(?P<cuda>[\w.]+)\s+py(?P<python>[\w.]+)\s+torch(?P<torch>[\w.+]+)")
 
 
 def normalize(name: str) -> str:
     """PEP 503 project-name normalization."""
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def cuda_tag(cuda: str) -> str:
+    """CUDA version as an index path segment: "13.0.2" -> "cu130"."""
+    major_minor = "".join(str(cuda).split(".")[:2])
+    return f"cu{major_minor}"
+
+
+def torch_tag(torch: str) -> str:
+    """Torch version as an index path segment: "2.13.0" -> "torch2.13".
+
+    Patch releases keep libtorch's ABI, so wheels are interchangeable within
+    a major.minor - the same granularity download.pytorch.org and
+    flashinfer.ai use for their index paths.
+    """
+    major_minor = ".".join(str(torch).split(".")[:2])
+    return f"torch{major_minor}"
+
+
+def world_path(cuda: str, torch: str) -> str:
+    """Index subtree one (CUDA, torch) pair is published under."""
+    return f"{cuda_tag(cuda)}/{torch_tag(torch)}"
+
+
+def release_worlds(title: str) -> List[str]:
+    """The CUDA/torch worlds a release's title says its wheels were built for."""
+    return list(
+        dict.fromkeys(
+            world_path(match["cuda"], match["torch"])
+            for match in _TITLE_SEGMENT_RE.finditer(title or "")
+        )
+    )
 
 
 def _gh_json(*args: str) -> object:
@@ -43,18 +103,44 @@ def _gh_json(*args: str) -> object:
 
 
 def list_wheel_assets(repo: str) -> List[WheelAsset]:
-    """Enumerate every .whl asset across every release in the repo."""
+    """Enumerate every .whl asset across every release in the repo.
+
+    A release whose title carries no parseable "cu.. py.. torch.." segment
+    cannot be placed in a world, so its wheels are reported and left out of
+    every index rather than guessed into one: an unlisted wheel is a visible
+    404, a misfiled one installs and then fails at import with an ABI error.
+    """
     releases = _gh_json(
-        "release", "list", "--repo", repo, "--json", "tagName", "--limit", "1000"
+        "release", "list", "--repo", repo, "--json", "tagName,name", "--limit", "1000"
     )
     assets: List[WheelAsset] = []
     for release in releases:  # type: ignore[union-attr]
         tag = release["tagName"]
+        worlds = release_worlds(release.get("name") or "")
         view = _gh_json("release", "view", tag, "--repo", repo, "--json", "assets")
-        for asset in view.get("assets", []):  # type: ignore[union-attr]
-            if asset["name"].endswith(".whl"):
-                assets.append({"name": asset["name"], "url": asset["url"]})
+        wheels = [
+            asset
+            for asset in view.get("assets", [])  # type: ignore[union-attr]
+            if asset["name"].endswith(".whl")
+        ]
+        if wheels and not worlds:
+            print(
+                f"Release {tag!r} has {len(wheels)} wheel(s) but no CUDA/torch segment "
+                f"in its title ({release.get('name')!r}); leaving them out of the index.",
+                file=sys.stderr,
+            )
+            continue
+        for asset in wheels:
+            assets.append({"name": asset["name"], "url": asset["url"], "worlds": worlds})
     return assets
+
+
+def group_by_world(assets: List[WheelAsset]) -> Dict[str, List[WheelAsset]]:
+    by_world: Dict[str, List[WheelAsset]] = defaultdict(list)
+    for asset in assets:
+        for world in asset["worlds"]:
+            by_world[world].append(asset)
+    return by_world
 
 
 def group_by_package(assets: List[WheelAsset]) -> Dict[str, List[WheelAsset]]:
@@ -82,10 +168,9 @@ def render_page(title: str, body: str) -> str:
     )
 
 
-def build_index(assets: List[WheelAsset], out_dir: Path) -> Dict[str, List[WheelAsset]]:
+def write_simple_tree(assets: List[WheelAsset], simple_dir: Path, label: str) -> Dict[str, List[WheelAsset]]:
+    """Write one PEP 503 "simple" tree (root listing + one page per package)."""
     by_package = group_by_package(assets)
-
-    simple_dir = out_dir / "simple"
     simple_dir.mkdir(parents=True, exist_ok=True)
 
     for package, package_assets in by_package.items():
@@ -101,35 +186,101 @@ def build_index(assets: List[WheelAsset], out_dir: Path) -> Dict[str, List[Wheel
         f'    <a href="{html.escape(pkg)}/">{html.escape(pkg)}</a><br/>'
         for pkg in sorted(by_package)
     )
-    (simple_dir / "index.html").write_text(render_page("verl-wheelhouse simple index", root_links))
+    (simple_dir / "index.html").write_text(render_page(label, root_links))
+    return by_package
 
+
+def build_index(
+    assets: List[WheelAsset], out_dir: Path, default_world: str
+) -> Dict[str, List[WheelAsset]]:
+    """Publish one index per CUDA/torch world, plus the default-world alias."""
+    by_world = group_by_world(assets)
+
+    for world, world_assets in by_world.items():
+        write_simple_tree(
+            world_assets,
+            out_dir / Path(world) / "simple",
+            f"verl-wheelhouse {world} simple index",
+        )
+
+    # /simple/ keeps serving the world versions.yaml currently builds, so URLs
+    # published before the split (and anything that just wants "what the
+    # wheelhouse builds today") keep working. Pin the world path instead to
+    # stay on one torch across a future bump.
+    write_simple_tree(
+        by_world.get(default_world, []),
+        out_dir / "simple",
+        f"verl-wheelhouse simple index ({default_world})",
+    )
+
+    worlds_list = "\n".join(
+        f'      <li><code>{html.escape(world)}/simple/</code> - '
+        f"{len(group_by_package(by_world[world]))} package(s)"
+        f"{' (also served at <code>/simple/</code>)' if world == default_world else ''}</li>"
+        for world in sorted(by_world)
+    )
     landing_body = (
         "    <h1>verl-wheelhouse</h1>\n"
         "    <p>Prebuilt CUDA wheels for apex, TransformerEngine, flash-attention, "
         "flashinfer, Megatron-Bridge, DeepEP and FlashMLA, built by "
         '<a href="https://github.com/verl-project/verl">verl</a>\'s wheelhouse CI.</p>\n'
+        "    <p>Wheels are ABI-bound to the CUDA and torch they were built "
+        "against, and their filenames record neither, so each combination has "
+        "its own index. Pick the one matching your environment:</p>\n"
+        "    <ul>\n"
+        f"{worlds_list}\n"
+        "    </ul>\n"
         "    <p>Install with:</p>\n"
-        "    <pre>pip install --extra-index-url &lt;this-pages-url&gt;/simple/ &lt;package&gt;</pre>\n"
-        '    <p><a href="simple/">Browse the package index</a></p>\n'
+        "    <pre>pip install --extra-index-url &lt;this-pages-url&gt;/"
+        f"{html.escape(default_world)}/simple/ &lt;package&gt;</pre>\n"
+        f'    <p><a href="{html.escape(default_world)}/simple/">Browse the current '
+        "index</a></p>\n"
     )
     (out_dir / "index.html").write_text(render_page("verl-wheelhouse", landing_body))
 
-    return by_package
+    return by_world
+
+
+def default_world(versions: Dict[str, object]) -> str:
+    """The world /simple/ aliases: the build_matrix's first row."""
+    matrix = versions["build_matrix"]  # type: ignore[index]
+    first = matrix[0]  # type: ignore[index]
+    return world_path(str(first["cuda"]), str(first["torch"]))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo", required=True, help="owner/repo, e.g. verl-project/verl-wheelhouse")
     parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument(
+        "--default-world",
+        default=None,
+        help=(
+            "Index subtree to also serve at /simple/, e.g. cu130/torch2.13. "
+            "Defaults to the world versions.yaml's first build_matrix row pins."
+        ),
+    )
     args = parser.parse_args()
+
+    world = args.default_world or default_world(load_versions())
 
     assets = list_wheel_assets(args.repo)
     if not assets:
         print("No .whl release assets found yet; publishing an empty index.", file=sys.stderr)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    by_package = build_index(assets, args.out_dir)
-    print(f"Indexed {len(assets)} wheel(s) across {len(by_package)} package(s).")
+    by_world = build_index(assets, args.out_dir, world)
+    if world not in by_world:
+        print(
+            f"No release wheels for the default world {world!r}; /simple/ is empty "
+            "(worlds found: " + (", ".join(sorted(by_world)) or "none") + ").",
+            file=sys.stderr,
+        )
+    summary = ", ".join(
+        f"{name} ({len(group_by_package(world_assets))} package(s))"
+        for name, world_assets in sorted(by_world.items())
+    )
+    print(f"Indexed {len(assets)} wheel(s) across {len(by_world)} world(s): {summary or 'none'}.")
 
 
 if __name__ == "__main__":

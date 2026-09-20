@@ -82,14 +82,14 @@ _TAG_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # one left implicit in release titles (see release_title).
 DEFAULT_ARCH = "x86_64"
 
-# Releases are split per (component, Python version): every interpreter gets
-# its own GitHub Release, so adding a Python row to the matrix creates new
-# releases instead of changing (and invalidating the skip detection of) the
-# existing ones. The interpreter the wheelhouse shipped before that split
-# keeps the historical bare "<component>-<ref>" tag and its original title,
-# so releases already on GitHub stay byte-stable and keep getting skipped;
-# every other interpreter is suffixed "-pyX.Y" (see release_tag).
-LEGACY_RELEASE_PYTHON = "3.12"
+# Releases are split per (component, Python version, torch version): the
+# wheel a component produces is ABI-bound to both, and the two dimensions
+# are spelled out in the tag rather than only in the title (see
+# release_tag). That is what keeps a torch bump from overwriting the
+# previous torch's wheels: the filenames carry neither version, so two torch
+# builds of the same ref would otherwise clobber each other's assets on one
+# release, silently serving an ABI-mismatched wheel from URLs that consumers
+# (and uv.lock files) already point at.
 
 # GitHub identifies every self-hosted runner by this label, whatever else it
 # carries, so its presence in a `runs_on` is what distinguishes a self-hosted
@@ -123,6 +123,11 @@ _PLATFORM_TAG_ARCHES = {
 #      timeouts/...) and the old monolithic common.sh are no longer inputs, so
 #      pure orchestration changes skip, and a shared lib rebuilds only the
 #      targets that source it. Bumping the schema forces one full sweep.
+# The manifest also gained a top-level `torch` (the version the release is
+# for, now that releases are split per (component, Python, torch)) without a
+# schema bump: skip detection compares only the `builds` entries, which
+# already carried torch, so manifests written before it stay comparable and
+# a tag-scheme change costs no rebuilds.
 BUILD_CONFIG_SCHEMA = 3
 BUILD_CONFIG_MARKER = "wheelhouse-build-config"
 # Machine-readable build snapshot uploaded as a release asset alongside the
@@ -154,6 +159,10 @@ def combo_arch(combo: Dict[str, Any]) -> str:
 
 def combo_python(combo: Dict[str, Any]) -> str:
     return str(combo["python"])
+
+
+def combo_torch(combo: Dict[str, Any]) -> str:
+    return str(combo["torch"])
 
 
 def matrix_arches(versions: Dict[str, Any]) -> List[str]:
@@ -234,21 +243,52 @@ def component_combos(versions: Dict[str, Any], component: str) -> List[Dict[str,
     ]
 
 
-def component_combos_for_python(
-    versions: Dict[str, Any], component: str, python: str
+def component_combos_for_release(
+    versions: Dict[str, Any], component: str, python: str, torch: str
 ) -> List[Dict[str, Any]]:
-    """The component's build_matrix rows for one Python version only.
+    """The component's build_matrix rows for one (Python, torch) pair only.
 
-    One GitHub Release covers exactly one (component, Python version) pair,
+    One GitHub Release covers exactly one (component, Python, torch) triple,
     so release title/manifest/notes are all computed from this subset rather
-    than from every combo the component builds (which now spans releases).
+    than from every combo the component builds (which spans releases). What
+    is left inside a single release is the arch dimension, which the wheel
+    filename's platform tag already distinguishes.
     """
-    python = str(python)
+    python, torch = str(python), str(torch)
     return [
         combo
         for combo in component_combos(versions, component)
-        if combo_python(combo) == python
+        if combo_python(combo) == python and combo_torch(combo) == torch
     ]
+
+
+def component_release_keys(
+    versions: Dict[str, Any], component: str
+) -> List[Tuple[str, str]]:
+    """Every (Python, torch) pair the component releases for, in matrix order."""
+    return list(
+        dict.fromkeys(
+            (combo_python(combo), combo_torch(combo))
+            for combo in component_combos(versions, component)
+        )
+    )
+
+
+def component_torch_versions(
+    versions: Dict[str, Any], component: str, python: str
+) -> List[str]:
+    """The torch versions one component builds for one interpreter.
+
+    Normally a single value - the matrix pins one torch per Python row - so
+    callers that know only the interpreter (e.g. ci/release_meta.py invoked
+    without --torch) can resolve the release unambiguously.
+    """
+    python = str(python)
+    return list(
+        dict.fromkeys(
+            torch for py, torch in component_release_keys(versions, component) if py == python
+        )
+    )
 
 
 def check_runner_policy(component: str, arch: str, runs_on: Any) -> None:
@@ -287,34 +327,30 @@ def sanitize_ref(ref: str) -> str:
     return sanitized or "unknown"
 
 
-def release_tag(component: str, ref: str, python: str) -> str:
-    """Persistent release tag for one (component, Python version) pair.
+def release_tag(component: str, ref: str, python: str, torch: str) -> str:
+    """Persistent release tag for one (component, Python, torch) triple.
 
-    Each component gets its own GitHub Release per interpreter it builds
-    for, keyed by its pinned ref rather than by a shared "latest"/repo-level
-    tag: rebuilding the same ref re-uploads wheels onto the same release,
-    and bumping the ref in versions.yaml starts a new release, leaving the
-    old one as history.
+    Keyed by the component's pinned ref rather than by a shared
+    "latest"/repo-level tag: rebuilding the same triple re-uploads wheels
+    onto the same release, and bumping the ref in versions.yaml starts a new
+    release, leaving the old one as history.
 
-    The interpreter the wheelhouse shipped before the per-Python split
-    (LEGACY_RELEASE_PYTHON) keeps the bare "component-ref" tag, e.g.
-    "apex-master", so releases already on GitHub keep their identity; every
-    other interpreter is tagged "component-ref-pyX.Y", e.g.
-    "apex-master-py3.11". Shared with ci/release_meta.py so the release that
-    gets created/updated and the tag _build.yml uploads wheels to always
-    match.
+    Python and torch are both spelled out, e.g.
+    "apex-master-py3.12-torch2.13.0", because a wheel is ABI-bound to both
+    and neither appears in the wheel filename: sharing one tag across torch
+    versions makes the second build clobber the first one's assets, which
+    breaks every consumer already pinned to those download URLs. Shared with
+    ci/release_meta.py so the release that gets created/updated and the tag
+    _build.yml uploads wheels to always match.
     """
-    tag = f"{component}-{sanitize_ref(ref)}"
-    if str(python) == LEGACY_RELEASE_PYTHON:
-        return tag
-    return f"{tag}-py{python}"
+    return f"{component}-{sanitize_ref(ref)}-py{python}-torch{torch}"
 
 
 def release_title(ref: str, component: str, combos: List[Dict[str, Any]]) -> str:
     """Describe the dependency combinations covered by one release.
 
-    `combos` is the subset for a single (component, Python version) release
-    (see component_combos_for_python). One "cu.. py.. torch.." segment per
+    `combos` is the subset for a single (component, Python, torch) release
+    (see component_combos_for_release). One "cu.. py.. torch.." segment per
     combination, prefixed by the arch for everything except DEFAULT_ARCH -
     x86_64 is the baseline every component builds, so leaving it implicit
     keeps the titles of x86_64-only releases stable (and their builds
@@ -520,34 +556,36 @@ def combo_build_config(
 
 
 def component_build_manifest(
-    versions: Dict[str, Any], component: str, python: str
+    versions: Dict[str, Any], component: str, python: str, torch: str
 ) -> Dict[str, Any]:
-    """JSON snapshot of every wheel-producing combo for one (component, Python)."""
+    """JSON snapshot of every wheel-producing combo for one release."""
     return {
         "schema": BUILD_CONFIG_SCHEMA,
         "component": component,
         "python": str(python),
+        "torch": str(torch),
         "builds": [
             combo_build_config(versions, component, combo)
-            for combo in component_combos_for_python(versions, component, python)
+            for combo in component_combos_for_release(versions, component, python, torch)
         ],
     }
 
 
 def format_release_notes(
-    versions: Dict[str, Any], component: str, python: str
+    versions: Dict[str, Any], component: str, python: str, torch: str
 ) -> str:
     """Human-readable notes plus a hidden JSON snapshot of each wheel's build config."""
     cfg = get_component(versions, component)
     ref = str(cfg["ref"])
     blob = json.dumps(
-        component_build_manifest(versions, component, python),
+        component_build_manifest(versions, component, python, torch),
         indent=2,
         sort_keys=True,
     )
     return (
-        f"Prebuilt CUDA wheel(s) for {component} on Python {python}, pinned to `{ref}`. "
-        "See versions.yaml at this ref for the exact dependency versions.\n\n"
+        f"Prebuilt CUDA wheel(s) for {component} on Python {python} / torch {torch}, "
+        f"pinned to `{ref}`. See versions.yaml at this ref for the exact dependency "
+        "versions.\n\n"
         f"<!-- {BUILD_CONFIG_MARKER}\n{blob}\n-->"
     )
 
@@ -763,9 +801,10 @@ def release_covers_combo(
     cfg = get_component(versions, component)
     ref = str(cfg["ref"])
     python = combo_python(combo)
-    tag = release_tag(component, ref, python)
+    torch = combo_torch(combo)
+    tag = release_tag(component, ref, python, torch)
     expected_title = release_title(
-        ref, component, component_combos_for_python(versions, component, python)
+        ref, component, component_combos_for_release(versions, component, python, torch)
     )
     actual_title = release.get("name")
     if actual_title != expected_title:
@@ -834,13 +873,14 @@ def release_covers_component(
     versions: Dict[str, Any],
     component: str,
     python: str,
+    torch: str,
     release: Dict[str, Any],
     repo: Optional[str] = None,
     verify_wheels: bool = True,
 ) -> Tuple[bool, str]:
-    """Check that every matrix row for one (component, Python) release is covered."""
+    """Check that every matrix row for one release is covered."""
     last_reason = "exact title, matching build config, and all expected wheel packages are present"
-    for combo in component_combos_for_python(versions, component, python):
+    for combo in component_combos_for_release(versions, component, python, torch):
         covered, reason = release_covers_combo(
             versions, component, combo, release, repo, verify_wheels=verify_wheels
         )
@@ -885,30 +925,30 @@ def inspect_release(repo: str, tag: str) -> Optional[Dict[str, Any]]:
 def components_needing_build(
     versions: Dict[str, Any], components: List[str], repo: str
 ) -> List[str]:
-    """Drop components whose every per-Python release already covers all rows.
+    """Drop components whose every release already covers all its rows.
 
-    A component ships one release per interpreter it builds for; each release
-    tag is inspected at most once, and the component is kept as soon as one
-    interpreter's release is missing or does not cover that interpreter's
-    rows.
+    A component ships one release per (Python, torch) pair it builds for;
+    each release tag is inspected at most once, and the component is kept as
+    soon as one of those releases is missing or does not cover its rows.
     """
     needed = []
     for component in components:
         cfg = get_component(versions, component)
         keep = False
-        for python in component_python_versions(versions, component):
-            tag = release_tag(component, str(cfg["ref"]), python)
+        for python, torch in component_release_keys(versions, component):
+            label = f"{component} py{python} torch{torch}"
+            tag = release_tag(component, str(cfg["ref"]), python, torch)
             release = inspect_release(repo, tag)
             if release is None:
                 keep = True
                 continue
             covered, reason = release_covers_component(
-                versions, component, python, release, repo
+                versions, component, python, torch, release, repo
             )
             if covered:
-                print(f"Skipping {component} py{python}: release {tag!r} {reason}.", file=sys.stderr)
+                print(f"Skipping {label}: release {tag!r} {reason}.", file=sys.stderr)
             else:
-                print(f"Keeping {component} py{python}: release {tag!r} has {reason}.", file=sys.stderr)
+                print(f"Keeping {label}: release {tag!r} has {reason}.", file=sys.stderr)
                 keep = True
         if keep:
             needed.append(component)
@@ -943,8 +983,8 @@ def evaluate_matrix_rows(
     """Decide build vs skip for every matrix row, with the reason why.
 
     Returns one record per input row: {"entry", "decision": "build"|"skip",
-    "reason"}. Each release tag is inspected at most once (a component now
-    ships one release per Python version). Fail-closed: a release that is
+    "reason"}. Each release tag is inspected at most once (a component ships
+    one release per (Python, torch) pair). Fail-closed: a release that is
     missing/unreadable, a missing/stale build manifest, a missing wheel, or a
     fatbin-coverage mismatch all decide "build".
     """
@@ -954,7 +994,7 @@ def evaluate_matrix_rows(
         component = str(entry["component"])
         python = str(entry["python"])
         tag = str(entry["release_tag"])
-        label = f"{component} ({entry['arch']}, py{python})"
+        label = f"{component} ({entry['arch']}, py{python}, torch{entry['torch']})"
         if tag not in releases:
             releases[tag] = inspect_release(repo, tag)
         release = releases[tag]
@@ -1070,7 +1110,9 @@ def build_matrix_entries(versions: Dict[str, Any], component: str) -> List[Dict[
                 "component": component,
                 "path": cfg["path"],
                 "ref": ref,
-                "release_tag": release_tag(component, ref, str(combo["python"])),
+                "release_tag": release_tag(
+                    component, ref, combo_python(combo), combo_torch(combo)
+                ),
                 "builder": cfg["builder"],
                 "arch": arch,
                 # Reusable-workflow inputs are strings, while GitHub Actions

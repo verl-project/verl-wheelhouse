@@ -407,7 +407,11 @@ jobs:
           HTTPS_PROXY: ${{ runner.environment == 'self-hosted' && secrets.BYTED_PROXY || '' }}
         run: |
           pip install pyyaml
-          python3 ci/release_meta.py --component "${{ inputs.component }}" > release-meta.json
+          # --python is left implicit: this step runs under the matrix row's
+          # own setup-python, which release_meta self-selects. torch has no
+          # such ambient source, so the row's pin is passed explicitly.
+          python3 ci/release_meta.py --component "${{ inputs.component }}" \
+            --torch "${{ inputs.torch-version }}" > release-meta.json
           TAG=$(python3 -c "import json; print(json.load(open('release-meta.json'))[0]['tag'])")
           TITLE=$(python3 -c "import json; print(json.load(open('release-meta.json'))[0]['title'])")
           MANIFEST=$(python3 -c "import json; print(json.load(open('release-meta.json'))[0]['manifest_asset'])")
