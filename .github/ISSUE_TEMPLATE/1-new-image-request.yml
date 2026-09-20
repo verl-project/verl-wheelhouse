@@ -48,7 +48,7 @@ body:
     attributes:
       label: Torch version
       description: Include torchvision / torchaudio if they matter for your use case.
-      placeholder: "2.11.0 (currently built), torchvision 0.26.0, torchaudio 2.11.0"
+      placeholder: "2.13.0 (currently built), torchvision 0.28.0, torchaudio 2.11.0"
     validations:
       required: true
 

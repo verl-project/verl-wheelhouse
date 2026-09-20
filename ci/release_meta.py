@@ -18,7 +18,7 @@ Release, keyed by the component's currently-pinned ref:
            (one segment per versions.yaml build_matrix row of that
            component *for that Python only*, with the x86_64 arch left
            implicit) e.g.
-           "apex master - cu13.0.2 py3.11 torch2.11.0; aarch64 cu13.0.2 py3.11 torch2.11.0"
+           "apex master - cu13.0.2 py3.11 torch2.13.0; aarch64 cu13.0.2 py3.11 torch2.13.0"
     notes: human-readable pin plus a hidden JSON snapshot of each wheel's
            build config (CUDA/Python/Torch, torch_cuda_arch_list, extra_env,
            builder, ...). Skip detection requires that snapshot to match

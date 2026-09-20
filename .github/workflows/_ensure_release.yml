@@ -4,7 +4,7 @@ name: "~Ensure release"
 # updates the LEGACY Python 3.12 GitHub Release(s):
 #   tag:   "<component>-<ref>"              e.g. "transformer-engine-v2.16.1"
 #   title: "<component> <ref> - cu<cuda> py3.12 torch<torch>[; ...]"
-#          e.g. "transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.11.0"
+#          e.g. "transformer-engine v2.16.1 - cu13.0.2 py3.12 torch2.13.0"
 # This workflow runs on Python 3.12 and calls ci/release_meta.py without
 # --python, so release_meta self-selects the running interpreter and emits
 # the legacy bare-tag metadata. Releases for every other Python version
