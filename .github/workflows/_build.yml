@@ -434,7 +434,22 @@ jobs:
               --title "$TITLE" \
               --notes-file release-notes.md
           fi
-          gh release upload "$TAG" "$MANIFEST" --repo "${{ github.repository }}" --clobber
+          # Two arch rows build the SAME release in parallel and both upload
+          # this identical, release-scoped manifest. `gh release upload
+          # --clobber` deletes an asset id it listed up front; the peer may
+          # have deleted it first, so the DELETE 404s. Retry re-lists assets
+          # and converges on the same content.
+          for attempt in 1 2 3 4 5 6; do
+            if gh release upload "$TAG" "$MANIFEST" --repo "${{ github.repository }}" --clobber; then
+              break
+            fi
+            if [ "$attempt" = 6 ]; then
+              echo "::error::manifest upload failed after 6 attempts (parallel clobber race)" >&2
+              exit 1
+            fi
+            echo "manifest upload attempt ${attempt} failed; retrying after backoff..."
+            sleep $((attempt * 5))
+          done
 
       - name: Upload wheel(s) to release ${{ inputs.release-version }}
         if: inputs.upload-to-release
