@@ -358,10 +358,13 @@ components:
     # / low-latency stay Hopper+ (A100 is intranode-only, matching
     # upstream). setup.py disables its aggressive PTX LD/ST tricks for
     # anything but a bare "9.0".
-    torch_cuda_arch_list: "8.0;9.0;10.0"
+    # 8.9 (L20, Ada) joins 8.0 here: the pre-Hopper rewrite below keys on
+    # __CUDA_ARCH__ < 900, so sm_89 takes the same intranode paths without
+    # any patch change; it stays intranode-only like A100.
+    torch_cuda_arch_list: "8.0;8.9;9.0;10.0"
     # Repo-root-relative files the build script applies to its checkout
-    # (deep_ep.sh runs the sm80 rewrite above whenever the arch list
-    # includes 8.0). Their sha256 goes into the release manifest's
+    # (deep_ep.sh runs the pre-Hopper rewrite whenever any arch in the list
+    # is older than 9.0). Their sha256 goes into the release manifest's
     # build_inputs, so editing a patch forces a rebuild instead of a
     # stale skip, and the build's fatbin is checked against the arch
     # list below before upload (see `verify_wheel_archs`).
