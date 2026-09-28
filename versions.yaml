@@ -315,7 +315,7 @@ components:
     # ">=3.12,<3.13", so even though build_matrix now also carries 3.11, this
     # component is pinned to the 3.12 rows via python_versions below.
     path: Megatron-Bridge
-    ref: r0.5.0 # NVIDIA-NeMo release branch for the 0.5.x line (moves as patch fixes land, like apex tracks master). Pin a v0.5.x tag instead for a frozen build.
+    ref: v0.6.2 # frozen release tag (the r0.6.0 branch head is already bumped to 0.6.3); pairs with megatron-core core_v0.19.x
     builder: megatron_bridge
     # Distribution name from pyproject's [project].name; the wheel file is
     # megatron_bridge-<ver>-py3-none-any.whl (normalizes to megatron-bridge).
