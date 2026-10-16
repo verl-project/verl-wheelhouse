@@ -265,9 +265,18 @@ pip install --extra-index-url https://verl-project.github.io/verl-wheelhouse/cu1
 pip install --extra-index-url https://verl-project.github.io/verl-wheelhouse/simple/ transformer-engine
 ```
 
-`cu130/torch2.13` still exists but, after the 13.2 move, carries only
-`flashinfer` - its rehosted jit-cache/cubin data wheels are not yet published
-for cu132; every other component is under `cu132/torch2.13`.
+The currently published worlds are `cu130/torch2.11`, `cu130/torch2.13`,
+`cu132/torch2.12` and `cu132/torch2.13` (the landing page lists exactly
+what exists). Notes:
+
+- `cu132/torch2.13` is the default `/simple` world and carries every native
+  component; `cu132/torch2.12` exists because torch 2.12.1 is the **lowest**
+  torch that publishes `+cu132` wheels (torch 2.11 is cu130-only), so it is
+  the cu132 world for consumers not yet on torch 2.13.
+- `cu130/torch2.13` carries the native kernels too (republished from
+  retained build artifacts after the cu130 -> cu132 move) plus `flashinfer`,
+  whose rehosted jit-cache/cubin data wheels are not published for cu132.
+- `cu130/torch2.11` preserves the original torch-2.11 stack verl pins.
 
 One component is deliberately present in **every** world: `megatron-bridge`
 is a pure-Python `py3-none-any` wheel with no CUDA payload, declared
