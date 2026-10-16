@@ -91,6 +91,44 @@ build_matrix:
     torch_audio: "2.11.0"
     cxx11_abi: "TRUE"
 
+  # ---- CUDA 13.2 + torch 2.12.1: the LOWEST torch that publishes +cu132
+  # wheels (cu132 support starts at torch 2.12 - torch 2.11 is cu130-only), so
+  # this is the cu132 world for consumers that cannot move to torch 2.13 yet.
+  # torch 2.12.1 + torchvision 0.27.1 ship official +cu132 wheels for
+  # cp311/cp312 on both arches; torchaudio has no cu132 build at all and is
+  # installed best-effort by the toolchain (no builder imports it).
+  - arch: x86_64
+    cuda: "13.2.2"
+    python: "3.11"
+    torch: "2.12.1"
+    torch_vision: "0.27.1"
+    torch_audio: "2.11.0"
+    cxx11_abi: "TRUE"
+
+  - arch: x86_64
+    cuda: "13.2.2"
+    python: "3.12"
+    torch: "2.12.1"
+    torch_vision: "0.27.1"
+    torch_audio: "2.11.0"
+    cxx11_abi: "TRUE"
+
+  - arch: aarch64
+    cuda: "13.2.2"
+    python: "3.11"
+    torch: "2.12.1"
+    torch_vision: "0.27.1"
+    torch_audio: "2.11.0"
+    cxx11_abi: "TRUE"
+
+  - arch: aarch64
+    cuda: "13.2.2"
+    python: "3.12"
+    torch: "2.12.1"
+    torch_vision: "0.27.1"
+    torch_audio: "2.11.0"
+    cxx11_abi: "TRUE"
+
   # ---- CUDA 13.0 retained for flashinfer only. Its builder rehosts the
   # prebuilt flashinfer-jit-cache / -cubin data wheels from flashinfer.ai,
   # which publishes no cu132 index yet (only .../whl/cu130). verl does not
