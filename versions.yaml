@@ -48,8 +48,8 @@
 build_matrix:
   # ---- CUDA 13.2 (current). torch 2.13.0 publishes official +cu132 wheels for
   # torch/torchvision on both arches and cp311/cp312, so every native kernel
-  # verl consumes builds here. The first row also selects the world /simple/
-  # aliases (see ci/build_index.py default_world), so it must stay a 13.2 row.
+  # verl consumes builds here. The world /simple/ aliases is set explicitly by
+  # `index.default_world` below (currently cu132/torch2.13), not by row order.
   - arch: x86_64
     cuda: "13.2.2"
     python: "3.11"
@@ -167,6 +167,15 @@ build_matrix:
     torch_vision: "0.28.0"
     torch_audio: "2.11.0"
     cxx11_abi: "TRUE"
+
+# Which CUDA/torch world the default /simple/ index aliases. Explicit rather
+# than "the first build_matrix row" so reordering the matrix can't silently
+# move /simple to another ABI. Keep this pointing at the current default the
+# verl main line consumes. ci/build_index.py reads it as index.default_world.
+index:
+  default_world:
+    cuda: "13.2.2"
+    torch: "2.13.0"
 
 # Versions verl's Dockerfiles pin for packages this repo does *not* build
 # (transformers/trl/nsight/megatron/verl itself). Tracked here purely so

@@ -211,6 +211,185 @@ class DefaultWorldTests(unittest.TestCase):
         }
         self.assertEqual("cu130/torch2.13", build_index.default_world(versions))
 
+    def test_explicit_default_world_overrides_matrix_order(self) -> None:
+        # Reordering the matrix must not move /simple: the explicit field wins.
+        versions = {
+            "index": {"default_world": {"cuda": "13.2.2", "torch": "2.13.0"}},
+            "build_matrix": [
+                {"cuda": "13.0.2", "python": "3.11", "torch": "2.11.0"},
+                {"cuda": "13.2.2", "python": "3.12", "torch": "2.13.0"},
+            ],
+        }
+        self.assertEqual("cu132/torch2.13", build_index.default_world(versions))
+
+
+class WheelTagTests(unittest.TestCase):
+    def test_wheel_version(self) -> None:
+        self.assertEqual("0.6.2", build_index.wheel_version("megatron_bridge-0.6.2-py3-none-any.whl"))
+        self.assertEqual(
+            "0.6.13+cu130",
+            build_index.wheel_version("flashinfer_jit_cache-0.6.13+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"),
+        )
+
+    def test_stable_abi3_wheel_supports_newer_cpython(self) -> None:
+        f = "flashinfer_jit_cache-0.6.13+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
+        self.assertTrue(build_index.wheel_supports(f, "3.12", "x86_64"))
+        self.assertTrue(build_index.wheel_supports(f, "3.11", "x86_64"))
+        self.assertFalse(build_index.wheel_supports(f, "3.12", "aarch64"))
+
+    def test_universal_and_native_support(self) -> None:
+        any_w = "megatron_bridge-0.6.2-py3-none-any.whl"
+        self.assertTrue(build_index.wheel_supports(any_w, "3.11", "x86_64"))
+        self.assertTrue(build_index.wheel_supports(any_w, "3.12", "aarch64"))
+        native = "apex-0.1-cp312-cp312-linux_x86_64.whl"
+        self.assertTrue(build_index.wheel_supports(native, "3.12", "x86_64"))
+        self.assertFalse(build_index.wheel_supports(native, "3.11", "x86_64"))
+        self.assertFalse(build_index.wheel_supports(native, "3.12", "aarch64"))
+
+    def test_hash_fragment(self) -> None:
+        self.assertEqual(
+            "#sha256:abc", build_index.hash_fragment("sha256:abc")
+        )
+        self.assertEqual("", build_index.hash_fragment(None))
+        self.assertEqual("", build_index.hash_fragment("md5:abc"))
+
+
+class HashFragmentIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = Path(self.tmp.name)
+
+    def test_page_links_carry_sha256_when_digest_known(self) -> None:
+        a = asset("apex-0.1-cp312-cp312-linux_x86_64.whl", ["cu130/torch2.13"])
+        a.update({"tag": "apex-master-py3.12-torch2.13.0-cu130", "digest": "sha256:deadbeef"})
+        build_index.build_index([a], self.out, "cu130/torch2.13", set())
+        page = (self.out / "cu130/torch2.13/simple/apex/index.html").read_text()
+        self.assertIn(a["url"] + "#sha256:deadbeef", page)
+        self.assertNotIn(a["url"] + "#sha256:deadbeef#", page)
+
+
+class UniversalDedupeTests(unittest.TestCase):
+    def _b(self, tag, worlds, digest, name="megatron_bridge-0.6.2-py3-none-any.whl"):
+        a = asset(name, worlds, url=f"https://example.invalid/{tag}/{name}")
+        a.update({"tag": tag, "digest": digest})
+        return a
+
+    def test_home_world_release_wins_over_mirrors(self) -> None:
+        home = self._b("mb-v0.6.2-py3.12-torch2.13.0-cu130", ["cu130/torch2.13"], "sha256:home")
+        mirror = self._b("mb-v0.6.2-py3.12-torch2.13.0-cu132", ["cu132/torch2.13"], "sha256:mirror")
+        out = build_index.dedupe_universal("cu130/torch2.13", [mirror, home], {"megatron-bridge"})
+        self.assertEqual([home], out)
+
+    def test_mirrored_world_picks_greatest_tag_deterministically(self) -> None:
+        old = self._b("mb-v0.6.2-py3.12-torch2.12.1-cu132", ["cu132/torch2.12"], "sha256:old")
+        new = self._b("mb-v0.6.2-py3.12-torch2.13.0-cu132", ["cu132/torch2.13"], "sha256:new")
+        out = build_index.dedupe_universal("cu130/torch2.13", [old, new], {"megatron-bridge"})
+        self.assertEqual([new], out)
+
+    def test_distinct_versions_are_not_collapsed(self) -> None:
+        v052 = self._b("mb-r0.5.0-py3.12-torch2.13.0", ["cu130/torch2.13"], "sha256:a",
+                       name="megatron_bridge-0.5.2-py3-none-any.whl")
+        v062 = self._b("mb-v0.6.2-py3.12-torch2.13.0-cu132", ["cu132/torch2.13"], "sha256:b")
+        out = build_index.dedupe_universal("cu130/torch2.13", [v052, v062], {"megatron-bridge"})
+        self.assertEqual([v052["url"], v062["url"]], sorted(a["url"] for a in out))
+
+    def test_build_index_lists_one_href_per_mirrored_version(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        out = Path(tmp.name)
+        old = self._b("mb-v0.6.2-py3.12-torch2.12.1-cu132", ["cu132/torch2.12"], "sha256:old")
+        new = self._b("mb-v0.6.2-py3.12-torch2.13.0-cu132", ["cu132/torch2.13"], "sha256:new")
+        build_index.build_index([old, new], out, "cu132/torch2.13", {"megatron-bridge"})
+        # In 2.13 the home release (new) wins; in 2.12 the home release (old) wins.
+        page213 = (out / "cu132/torch2.13/simple/megatron-bridge/index.html").read_text()
+        self.assertEqual(1, page213.count("<a "))
+        self.assertIn(new["url"], page213)
+        self.assertNotIn(old["url"], page213)
+        page212 = (out / "cu132/torch2.12/simple/megatron-bridge/index.html").read_text()
+        self.assertEqual(1, page212.count("<a "))
+        self.assertIn(old["url"], page212)
+        self.assertNotIn(new["url"], page212)
+
+
+class CoverageGateTests(unittest.TestCase):
+    VERSIONS = {
+        "build_matrix": [
+            {"arch": "x86_64", "cuda": "13.2.2", "python": "3.11", "torch": "2.13.0"},
+            {"arch": "x86_64", "cuda": "13.2.2", "python": "3.12", "torch": "2.13.0"},
+        ],
+        "components": {"apex": {"wheel_packages": ["apex"]}},
+    }
+
+    @staticmethod
+    def _a(name, world):
+        a = asset(name, [world], url=f"https://example.invalid/{name}")
+        a.update({"tag": "t", "digest": None})
+        return a
+
+    def test_complete_matrix_has_no_gaps(self) -> None:
+        by_world = {
+            "cu132/torch2.13": [
+                self._a("apex-0.1-cp311-cp311-linux_x86_64.whl", "cu132/torch2.13"),
+                self._a("apex-0.1-cp312-cp312-linux_x86_64.whl", "cu132/torch2.13"),
+            ]
+        }
+        self.assertEqual([], build_index.coverage_gaps(self.VERSIONS, by_world))
+
+    def test_missing_python_arch_cell_is_a_gap(self) -> None:
+        # cp312 wheel is absent: exactly the cu132/torch2.12 flash-attention shape.
+        by_world = {
+            "cu132/torch2.13": [
+                self._a("apex-0.1-cp311-cp311-linux_x86_64.whl", "cu132/torch2.13"),
+            ]
+        }
+        gaps = build_index.coverage_gaps(self.VERSIONS, by_world)
+        self.assertEqual(1, len(gaps))
+        self.assertEqual("3.12", gaps[0]["python"])
+        self.assertEqual("x86_64", gaps[0]["arch"])
+
+    def test_universal_wheel_covers_every_cell(self) -> None:
+        versions = {
+            "build_matrix": [
+                {"arch": "x86_64", "cuda": "13.2.2", "python": "3.12", "torch": "2.13.0"},
+                {"arch": "aarch64", "cuda": "13.2.2", "python": "3.12", "torch": "2.13.0"},
+            ],
+            "components": {"megatron-bridge": {"wheel_packages": ["megatron-bridge"]}},
+        }
+        by_world = {
+            "cu132/torch2.13": [
+                self._a("megatron_bridge-0.6.2-py3-none-any.whl", "cu132/torch2.13")
+            ]
+        }
+        self.assertEqual([], build_index.coverage_gaps(versions, by_world))
+
+
+class CompatAliasTests(unittest.TestCase):
+    def test_compat_alias_release_is_skipped_silently(self, ) -> None:
+        releases = [
+            {"tagName": "apex-master-py3.12-torch2.13.0",
+             "name": "[compat alias, not indexed] apex-master-py3.12-torch2.13.0 - canonical: apex-master-py3.12-torch2.13.0-cu130"},
+        ]
+        view = {"assets": [
+            {"name": "apex-0.1-cp312-cp312-linux_x86_64.whl",
+             "url": "https://example.invalid/a.whl", "digest": "sha256:x"},
+        ]}
+        orig = build_index._gh_json
+        import io
+        import contextlib
+
+        def fake(*args):  # type: ignore[no-untyped-def]
+            return view if args[:2] == ("release", "view") else releases
+        try:
+            build_index._gh_json = fake  # type: ignore[assignment]
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                assets = build_index.list_wheel_assets("o/r")
+            self.assertEqual([], assets)
+            self.assertNotIn("CUDA/torch segment", err.getvalue())
+        finally:
+            build_index._gh_json = orig  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     unittest.main()

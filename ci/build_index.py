@@ -55,13 +55,32 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, TypedDict
 
-from generate_matrix import load_versions
+from generate_matrix import (
+    combo_arch,
+    combo_cuda,
+    combo_python,
+    combo_torch,
+    component_combos,
+    load_versions,
+)
+
+# Title prefix on hand-created compatibility-alias releases (see
+# ci/restore_compat_tags.py): they exist only to keep frozen direct-download
+# URLs alive after a tag-scheme migration, are deliberately not indexed, and
+# must not spam the "no CUDA/torch segment" warning on every publish.
+COMPAT_ALIAS_PREFIX = "[compat alias"
 
 
 class WheelAsset(TypedDict):
     name: str
     url: str
     worlds: List[str]
+    # GitHub release tag the asset lives on (for deterministic dedup tie-breaks).
+    tag: str
+    # Asset content digest exactly as the GitHub API reports it, e.g.
+    # "sha256:90c5…" (None when GitHub has none). Used for PEP 503 hash
+    # fragments and to detect same-version wheels whose bytes differ.
+    digest: "str | None"
 
 
 # "cu13.0.2 py3.12 torch2.13.0" segments of a release title (see
@@ -85,6 +104,109 @@ def wheel_distribution(filename: str) -> str:
 def is_universal_wheel(filename: str) -> bool:
     """True for a py3-none-any (interpreter/ABI/platform-independent) wheel."""
     return filename[: -len(".whl")].rsplit("-", 1)[-1] == "any"
+
+
+def wheel_version(filename: str) -> str:
+    """Distribution version from a wheel filename: 'megatron_bridge-0.6.2-...' -> '0.6.2'."""
+    stem = filename[: -len(".whl")]
+    parts = stem.split("-")
+    # name-version-pythontag-abitag-platformtag; name/version carry no '-'.
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def wheel_tags(filename: str) -> "tuple[str, str, str]":
+    """(python-tag, abi-tag, platform-tag) from a wheel filename.
+
+    e.g. 'apex-0.1-cp312-cp312-linux_x86_64.whl' -> ('cp312', 'cp312', 'linux_x86_64')
+         'flashinfer_jit_cache-0.6.13+cu130-cp39-abi3-manylinux_2_28_x86_64.whl'
+            -> ('cp39', 'abi3', 'manylinux_2_28_x86_64')
+         'megatron_bridge-0.6.2-py3-none-any.whl' -> ('py3', 'none', 'any')
+    """
+    stem = filename[: -len(".whl")]
+    parts = stem.split("-")
+    platform = parts[-1]
+    abi = parts[-2] if len(parts) >= 2 else "none"
+    pytag = parts[-3] if len(parts) >= 3 else "py3"
+    return pytag, abi, platform
+
+
+def wheel_supports(filename: str, python: str, arch: str) -> bool:
+    """Whether a wheel can install on the given CPython version and CPU arch.
+
+    Used by the coverage gate. Platform is an exact arch match or the 'any'
+    universal tag. Python matches on an exact cp<XY> tag, a forward-compatible
+    stable-ABI 'abi3' wheel (cp39-abi3 runs on 3.11/3.12), or a universal
+    'py3' wheel.
+    """
+    pytag, abi, platform = wheel_tags(filename)
+    if platform != "any" and arch not in platform:
+        return False
+    cp = f"cp{str(python).replace('.', '')}"
+    return pytag == "py3" or abi == "abi3" or pytag == cp
+
+
+def hash_fragment(digest: "str | None") -> str:
+    """PEP 503 '#sha256=<hex>' href fragment from a GitHub asset digest.
+
+    GitHub reports digests as 'sha256:<hex>'; only sha256 is emitted (pip's
+    --require-hashes / uv honor it). Wheels without a recorded digest get no
+    fragment rather than a guessed one.
+    """
+    if digest and digest.startswith("sha256:"):
+        return f"#{digest}"
+    return ""
+
+
+def dedupe_universal(world: str, assets: List[WheelAsset], agnostic: set) -> List[WheelAsset]:
+    """Collapse mirrored same-version universal wheels to one href per world.
+
+    A world-agnostic distribution is mirrored into every world, so a single
+    version can be reachable from several releases (e.g. a wheel rebuilt for a
+    newer torch world, plus the original). Their filenames are identical, so a
+    simple index lists duplicate hrefs for one version. We keep exactly one,
+    choosing deterministically:
+
+      1. the release whose title declares THIS world (the wheel's real home);
+      2. otherwise the lexicographically greatest release tag (reproducible,
+         and newer torch/cuda tags sort ahead).
+
+    Wheels with differing digests are byte-different despite the identical
+    name/version; that is reported loudly instead of being hidden.
+    """
+    groups: "dict[tuple[str, str], List[WheelAsset]]" = defaultdict(list)
+    passthrough: List[WheelAsset] = []
+    for a in assets:
+        dist = wheel_distribution(a["name"])
+        if is_universal_wheel(a["name"]) and dist in agnostic:
+            groups[(dist, wheel_version(a["name"]))].append(a)
+        else:
+            passthrough.append(a)
+    out = list(passthrough)
+    for (_dist, _ver), group in groups.items():
+        chosen = sorted(group, key=lambda g: (world in g["worlds"], g.get("tag", "")))[-1]
+        out.append(chosen)
+    return out
+
+
+def warn_universal_digest_collisions(assets: List[WheelAsset], agnostic: set) -> None:
+    """Report once per (dist, version) when same-named universal wheels differ
+    in digest across releases (zip-timestamp-only rebuilds differ here too -
+    the index picks one deterministically via dedupe_universal)."""
+    seen: "dict[tuple[str, str], dict[str, str]]" = defaultdict(dict)
+    for a in assets:
+        if not (is_universal_wheel(a["name"]) and wheel_distribution(a["name"]) in agnostic):
+            continue
+        d = a.get("digest")
+        if d:
+            seen[(wheel_distribution(a["name"]), wheel_version(a["name"]))][a.get("tag", "?")] = d
+    for (dist, ver), by_tag in seen.items():
+        if len(set(by_tag.values())) > 1:
+            detail = ", ".join(f"{tag}={digest}" for tag, digest in sorted(by_tag.items()))
+            print(
+                f"warning: universal wheel {dist}=={ver} ships from {len(by_tag)} releases "
+                f"with DIFFERENT digests (indexing one per world): {detail}",
+                file=sys.stderr,
+            )
 
 
 def world_agnostic_distributions(versions: Dict[str, object]) -> set:
@@ -164,7 +286,9 @@ def list_wheel_assets(repo: str) -> List[WheelAsset]:
     assets: List[WheelAsset] = []
     for release in releases:  # type: ignore[union-attr]
         tag = release["tagName"]
-        worlds = release_worlds(release.get("name") or "")
+        title = release.get("name") or ""
+        worlds = release_worlds(title)
+        compat_alias = title.lstrip().startswith(COMPAT_ALIAS_PREFIX)
         view = _gh_json("release", "view", tag, "--repo", repo, "--json", "assets")
         wheels = [
             asset
@@ -172,14 +296,26 @@ def list_wheel_assets(repo: str) -> List[WheelAsset]:
             if asset["name"].endswith(".whl")
         ]
         if wheels and not worlds:
+            if compat_alias:
+                # Deliberate URL-only compatibility shim; skip quietly so its
+                # presence doesn't dilute the fail-closed warning below.
+                continue
             print(
                 f"Release {tag!r} has {len(wheels)} wheel(s) but no CUDA/torch segment "
-                f"in its title ({release.get('name')!r}); leaving them out of the index.",
+                f"in its title ({title!r}); leaving them out of the index.",
                 file=sys.stderr,
             )
             continue
         for asset in wheels:
-            assets.append({"name": asset["name"], "url": asset["url"], "worlds": worlds})
+            assets.append(
+                {
+                    "name": asset["name"],
+                    "url": asset["url"],
+                    "worlds": worlds,
+                    "tag": tag,
+                    "digest": asset.get("digest"),
+                }
+            )
     return assets
 
 
@@ -189,9 +325,14 @@ def group_by_world(
     agnostic: set,
 ) -> Dict[str, List[WheelAsset]]:
     by_world: Dict[str, List[WheelAsset]] = defaultdict(list)
+    grouped: Dict[str, List[WheelAsset]] = defaultdict(list)
     for asset in assets:
         for world in assign_worlds(asset, all_worlds, agnostic):
-            by_world[world].append(asset)
+            grouped[world].append(asset)
+    # One href per (agnostic-distribution, version) per world even when several
+    # mirrored releases ship the same universal filename.
+    for world, world_assets in grouped.items():
+        by_world[world] = dedupe_universal(world, world_assets, agnostic)
     return by_world
 
 
@@ -229,7 +370,8 @@ def write_simple_tree(assets: List[WheelAsset], simple_dir: Path, label: str) ->
         pkg_dir = simple_dir / package
         pkg_dir.mkdir(parents=True, exist_ok=True)
         links = "\n".join(
-            f'    <a href="{html.escape(a["url"])}">{html.escape(a["name"])}</a><br/>'
+            f'    <a href="{html.escape(a["url"] + hash_fragment(a.get("digest")))}">'
+            f"{html.escape(a['name'])}</a><br/>"
             for a in sorted(package_assets, key=lambda a: a["name"])
         )
         (pkg_dir / "index.html").write_text(render_page(package, links))
@@ -303,10 +445,57 @@ def build_index(
 
 
 def default_world(versions: Dict[str, object]) -> str:
-    """The world /simple/ aliases: the build_matrix's first row."""
+    """The world /simple/ aliases.
+
+    Explicit is best: versions.yaml's `index.default_world` {cuda,torch} names
+    it, so reordering build_matrix rows can't silently move /simple to another
+    ABI. Falls back to the first build_matrix row for older versions files.
+    """
+    index = versions.get("index", {})  # type: ignore[union-attr]
+    explicit = (index or {}).get("default_world") if isinstance(index, dict) else None
+    if isinstance(explicit, dict) and explicit.get("cuda") and explicit.get("torch"):
+        return world_path(str(explicit["cuda"]), str(explicit["torch"]))
     matrix = versions["build_matrix"]  # type: ignore[index]
     first = matrix[0]  # type: ignore[index]
     return world_path(str(first["cuda"]), str(first["torch"]))
+
+
+def coverage_gaps(
+    versions: Dict[str, object],
+    by_world: Dict[str, List[WheelAsset]],
+) -> List[Dict[str, str]]:
+    """Expected (world, package, python, arch) cells with no installable wheel.
+
+    The expected matrix is derived exactly like the build matrix is: each
+    component's component_combos() after its arches/python_versions/
+    cuda_versions filters, crossed with its wheel_packages. A cell is covered
+    when some wheel indexed in that world matches the package and supports the
+    combo's CPython + arch (native cp tag, forward-compatible abi3, or a
+    universal py3-none-any wheel). This turns a silently partial world - one
+    failed arch build with the others green - into a hard publish failure.
+    """
+    gaps: List[Dict[str, str]] = []
+    components = versions.get("components", {})  # type: ignore[union-attr]
+    for component, cfg in components.items():  # type: ignore[union-attr]
+        packages = [normalize(p) for p in cfg.get("wheel_packages", [])]  # type: ignore[union-attr]
+        if not packages:
+            continue
+        for combo in component_combos(versions, component):
+            arch, python = combo_arch(combo), combo_python(combo)
+            world = world_path(combo_cuda(combo), combo_torch(combo))
+            present = by_world.get(world, [])
+            for package in packages:
+                covered = any(
+                    wheel_distribution(a["name"]) == package
+                    and wheel_supports(a["name"], python, arch)
+                    for a in present
+                )
+                if not covered:
+                    gaps.append(
+                        {"world": world, "component": str(component), "package": package,
+                         "python": str(python), "arch": arch}
+                    )
+    return gaps
 
 
 def main() -> None:
@@ -318,7 +507,17 @@ def main() -> None:
         default=None,
         help=(
             "Index subtree to also serve at /simple/, e.g. cu130/torch2.13. "
-            "Defaults to the world versions.yaml's first build_matrix row pins."
+            "Defaults to versions.yaml's index.default_world, else the first "
+            "build_matrix row."
+        ),
+    )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help=(
+            "Publish even when the expected (component, python, arch) coverage "
+            "matrix has gaps. Default is fail-closed: a partial world blocks the "
+            "publish instead of silently serving an index with a missing wheel."
         ),
     )
     args = parser.parse_args()
@@ -334,6 +533,8 @@ def main() -> None:
     if not assets:
         print("No .whl release assets found yet; publishing an empty index.", file=sys.stderr)
 
+    warn_universal_digest_collisions(assets, agnostic)
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
     by_world = build_index(assets, args.out_dir, world, agnostic)
     if world not in by_world:
@@ -342,6 +543,28 @@ def main() -> None:
             "(worlds found: " + (", ".join(sorted(by_world)) or "none") + ").",
             file=sys.stderr,
         )
+
+    gaps = coverage_gaps(versions, by_world)
+    if gaps:
+        for g in gaps:
+            print(
+                f"coverage gap: {g['world']} {g['package']} has no wheel for "
+                f"python {g['python']} / {g['arch']} (component {g['component']})",
+                file=sys.stderr,
+            )
+        if not args.allow_partial:
+            print(
+                f"FAIL: {len(gaps)} expected wheel(s) missing. Rebuild the failed "
+                "job(s), or rerun with --allow-partial to publish anyway.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(
+            f"warning: publishing despite {len(gaps)} coverage gap(s) "
+            "(--allow-partial set).",
+            file=sys.stderr,
+        )
+
     summary = ", ".join(
         f"{name} ({len(group_by_package(world_assets))} package(s))"
         for name, world_assets in sorted(by_world.items())
