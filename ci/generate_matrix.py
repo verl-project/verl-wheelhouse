@@ -424,6 +424,13 @@ def release_tag(component: str, ref: str, python: str, torch: str, cuda: str) ->
     an ABI-mismatched wheel to every URL already pinned. Shared with
     ci/release_meta.py so the release that gets created/updated and the tag
     _build.yml uploads wheels to always match.
+
+    Tags are an append-only contract: downstream uv.lock files pin the full
+    /releases/download/<tag>/<file> URL, so deleting or renaming a tag with
+    wheels turns those locks into 404s (the 2026-10 cu130 cleanup incident).
+    Never delete a release/tag a consumer might pin; if a tag must move, keep
+    the old tag serving the same bytes (a compat-alias release, see
+    ci/restore_compat_tags.py) instead of removing it.
     """
     return (
         f"{component}-{sanitize_ref(ref)}-py{python}-torch{torch}"

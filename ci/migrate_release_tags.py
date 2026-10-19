@@ -17,9 +17,11 @@ to match, so their assets keep their identity instead of being rebuilt:
 
 Nothing is recompiled and no asset is re-uploaded; `gh release edit --tag`
 only moves the release (and creates the new git tag). The old tag's download
-URLs stop resolving, which is the intended outcome: a 404 is a loud signal to
-re-pin, where a CUDA bump silently overwriting the wheels behind a URL lock
-files reference was a silent ABI mismatch.
+URLs then stop resolving, which breaks any uv.lock that pins them - tags are
+append-only (see release_tag in ci/generate_matrix.py). Before renaming,
+check for pinned URLs (grep downstream uv.lock files); if any exist, recreate
+each old tag as a compat alias with ci/restore_compat_tags.py so the frozen
+URLs keep serving the same bytes. Do not prune a pinned tag.
 
 The new tag is derived from the release *title*, which release_meta.py
 generates as "<component> <ref> - [<arch> ]cu<cuda> py<python> torch<torch>",
@@ -32,8 +34,10 @@ dash-separated tag. Two consequences worth knowing before running it:
     wheels are not from yet - and retagging mid-run also moves the release
     out from under the job's own upload step.
   * `gh release edit --tag` creates the new git tag but leaves the old one
-    behind, pointing at the same commit with no release on it. Prune them
-    with `git push --delete origin <old-tag>` once the new tags look right.
+    behind, pointing at the same commit with no release on it. Only prune
+    those leftover git tags with `git push --delete origin <old-tag>` once
+    the new tags look right AND no lock pins the old download URLs; recreate
+    compat aliases first otherwise.
 
 Usage:
     python ci/migrate_release_tags.py --repo <owner>/<repo>            # dry run
