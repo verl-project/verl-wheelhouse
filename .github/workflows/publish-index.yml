@@ -7,8 +7,23 @@ name: Publish package index
 # without rebuilding any wheels.
 
 on:
-  workflow_dispatch: {}
-  workflow_call: {}
+  workflow_dispatch:
+    inputs:
+      allow_partial:
+        description: >-
+          Publish even when the coverage gate reports missing wheels. Leave
+          unchecked (default): fail-closed, a partial world blocks the publish.
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      allow_partial:
+        description: >-
+          Publish even when the coverage gate reports missing wheels
+          (default: fail-closed).
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -36,7 +51,11 @@ jobs:
       - name: Generate PEP 503 index
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 ci/build_index.py --repo "${{ github.repository }}" --out-dir _site
+        run: >
+          python3 ci/build_index.py
+          --repo "${{ github.repository }}"
+          --out-dir _site
+          ${{ inputs.allow_partial && '--allow-partial' || '' }}
 
       - uses: actions/upload-pages-artifact@v3
         with:
