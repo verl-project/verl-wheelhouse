@@ -23,6 +23,13 @@ source "${SCRIPT_DIR}/lib/arch.sh"
 
 export_extra_env
 
+# TransformerEngine v2.20's NCCL EP needs APIs newer than NCCL 2.28.9, which
+# is the latest package NVIDIA publishes for CUDA 13.0 on x86_64 and SBSA.
+# Keep the rest of TE enabled for cu130; cu132 retains the default NCCL EP.
+if [[ "${CUDA_VERSION}" == 13.0.* ]]; then
+  export NVTE_WITH_NCCL_EP=0
+fi
+
 install_nccl
 
 # Both verl Dockerfiles pre-install these before building TransformerEngine.
