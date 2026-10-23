@@ -130,13 +130,12 @@ build_matrix:
     torch_audio: "2.11.0"
     cxx11_abi: "TRUE"
 
-  # ---- CUDA 13.0 retained for flashinfer only. Its builder rehosts the
-  # prebuilt flashinfer-jit-cache / -cubin data wheels from flashinfer.ai,
-  # which publishes no cu132 index yet (only .../whl/cu130). verl does not
-  # consume this component from the wheelhouse (vllm/sglang pin flashinfer from
-  # PyPI), so it stays on 13.0 until upstream ships cu132. Components choose
-  # their CUDA row(s) via `cuda_versions` below (several are allowed - each is
-  # a separate cuda-keyed release); drop these rows once flashinfer moves.
+  # ---- CUDA 13.0 (legacy verl cu130 stack). flashinfer rehosts prebuilt
+  # jit-cache / -cubin data wheels from flashinfer.ai (no cu132 index yet).
+  # transformer-engine also builds here so cu130/torch2.13 consumers can install
+  # the pinned TE ref without moving to cu132. Components choose their CUDA
+  # row(s) via `cuda_versions` below (several are allowed - each is a separate
+  # cuda-keyed release).
   - arch: x86_64
     cuda: "13.0.2"
     python: "3.11"
@@ -358,7 +357,9 @@ components:
     ref: v2.20.2 # ahead of verl's TRANSFORMER_ENGINE_VERSION (v2.15 as of verl v0.7.1)
     builder: transformer_engine
     wheel_packages: [transformer-engine]
-    cuda_versions: ["13.2.2"]
+    cuda_versions: ["13.2.2", "13.0.2"]
+    # verl's Dockerfiles pin Python 3.12; skip cp311 rows to halve TE runner time.
+    python_versions: ["3.12"]
     torch_cuda_arch_list: "8.0;9.0;10.0"
     requires_cudnn: true
     # Effective nvcc concurrency is max_jobs x NVTE_BUILD_THREADS_PER_JOB, so
