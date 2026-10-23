@@ -31,7 +31,8 @@ install_nccl() {
     echo "::error::No libnccl-dev package found for +cuda${cuda_short}" >&2
     exit 1
   fi
-  maybe_sudo apt-get install -y --no-install-recommends --allow-change-held-packages \
+  maybe_sudo apt-get install -y --no-install-recommends --allow-downgrades \
+    --allow-change-held-packages \
     "libnccl-dev=${nccl_ver}" "libnccl2=${nccl_ver}"
   echo "Installed libnccl-dev=${nccl_ver} libnccl2=${nccl_ver}"
   echo "::endgroup::"
