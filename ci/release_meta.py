@@ -106,9 +106,8 @@ def resolve_cuda(
 ) -> str:
     """The CUDA version a release is for, inferred when not passed explicitly.
 
-    Each active component pins one CUDA per (Python, torch), so the
-    _build.yml path (which passes --torch but no --cuda under setup-python)
-    resolves it unambiguously; a historical/multi-CUDA matrix must name it.
+    The build workflow passes --cuda explicitly. Interactive callers may
+    omit it only when the selected (component, Python, torch) has one CUDA.
     """
     available = [
         c

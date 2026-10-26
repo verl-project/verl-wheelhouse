@@ -22,3 +22,6 @@
 [submodule "fast-hadamard-transform"]
 	path = fast-hadamard-transform
 	url = https://github.com/Dao-AILab/fast-hadamard-transform.git
+[submodule "DeepGEMM"]
+	path = DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git

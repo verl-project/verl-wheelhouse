@@ -10,6 +10,7 @@ heavy native-extension dependencies of [verl](https://github.com/verl-project/ve
 | [flash-attention](https://github.com/Dao-AILab/flash-attention) | `flash-attention` | `flash_attn` |
 | [flashinfer](https://github.com/flashinfer-ai/flashinfer) | `flashinfer` | `flashinfer-python`, `flashinfer-cubin`, `flashinfer-jit-cache` |
 | [Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) | `Megatron-Bridge` | `megatron-bridge` (pure-Python `py3-none-any` wheel) |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) | `DeepGEMM` | `deep-gemm` (host extension + runtime JIT headers; [compatibility](docs/deep-gemm.md)) |
 | [DeepEP](https://github.com/deepseek-ai/DeepEP) | `DeepEP` | `deep-ep` (MoE all-to-all, linked against NVSHMEM) |
 | [FlashMLA](https://github.com/deepseek-ai/FlashMLA) | `FlashMLA` | `flash-mla` (MLA decode/prefill, `sm90a` + `sm100f`) |
 | [fast-hadamard-transform](https://github.com/Dao-AILab/fast-hadamard-transform) | `fast-hadamard-transform` | `fast-hadamard-transform` (Hadamard kernels for DeepSeek sparse attention) |
@@ -17,7 +18,8 @@ heavy native-extension dependencies of [verl](https://github.com/verl-project/ve
 The rollout engines (`vllm`, `sglang`) are deliberately *not* built here -
 upstream's own published wheels are used instead.
 
-Build commands follow the exact flags used in verl's own
+Build commands follow upstream build instructions and, where applicable,
+the flags used in verl's own
 [`docker/Dockerfile.stable.sglang`](https://github.com/verl-project/verl/blob/main/docker/Dockerfile.stable.sglang)
 and
 [`docker/Dockerfile.stable.vllm`](https://github.com/verl-project/verl/blob/main/docker/Dockerfile.stable.vllm),
@@ -57,6 +59,7 @@ ci/
     flashinfer.sh
     megatron_bridge.sh
     deep_ep.sh
+    deep_gemm.sh
     flash_mla.sh
     fast_hadamard_transform.sh
     lib/                   # shared leaf helpers, sourced only by the builders that use them
@@ -76,6 +79,7 @@ ci/
   build-flashinfer.yml
   build-megatron-bridge.yml
   build-deep-ep.yml
+  build-deep-gemm.yml
   build-flash-mla.yml
   build-fast-hadamard-transform.yml
   build-all.yml           # builds every component x every matrix combo
@@ -101,22 +105,22 @@ change for routine version bumps:
   torch is kept ahead of their `2.11.0` pin; 3.11 is added because torch
   publishes cp311 cu132 wheels for both arches and downstream envs still run
   it), on `x86_64` and `aarch64`. The matrix also still carries CUDA
-  `13.0.2` rows, retained for `flashinfer` alone: it rehosts prebuilt
-  jit-cache/cubin data wheels that upstream does not yet publish for cu132.
-  Add another entry to build more combinations - every component is built
-  once per entry here, minus the ones its `arches` / `python_versions` /
-  `cuda_versions` filters exclude. Each component is pinned to exactly one
-  CUDA per (Python, torch) via `cuda_versions`; releases are not keyed by
-  CUDA (only by component/Python/torch), so spanning two CUDA worlds for one
-  pair is rejected and the tag scheme would have to become CUDA-keyed first.
+  `13.0.2` rows: torch 2.13 for `flashinfer`'s prebuilt data wheels and
+  TransformerEngine, plus torch 2.11 for DeepGEMM's initial VeOmni
+  training stack. DeepGEMM is limited to torch 2.11 + cu130 on Python
+  3.11/3.12 and x86_64/aarch64. Add another entry to build more combinations.
+  Every component is built once per entry here, minus
+  the ones its `arches` / `python_versions` / `cuda_versions` /
+  `torch_versions` filters exclude. Releases are keyed by component,
+  Python, torch and CUDA, so different ABI worlds do not overwrite one another.
 
 - **`components`**: per-submodule config - the git `ref` to build (branch,
   tag, or commit; overrides whatever commit the submodule pointer in this
   repo is on), which `ci/build_scripts/<builder>.sh` to run, the CUDA arch
   list, whether cuDNN is required, `max_jobs`, the runner label, which CPU
   arches to build for (`arches`), which Python versions (`python_versions`)
-  and which CUDA versions (`cuda_versions`) to build for, with optional
-  per-arch field overrides (`arch_overrides`), and any extra environment
+  and which CUDA / torch versions (`cuda_versions` / `torch_versions`) to
+  build for, with optional per-arch field overrides (`arch_overrides`), and any extra environment
   variables.
 
 - **`verl_reference_versions`**: versions verl's Dockerfiles pin for things
@@ -183,9 +187,9 @@ republished from retained build artifacts with `restore_release_wheels.py`
 The build workflow creates the release inline while uploading: `_build.yml`
 runs `ci/release_meta.py` under the matrix row's own setup-python
 interpreter, so the interpreter needs no workflow input (no `--python` is
-passed); torch has no such ambient source and is passed as `--torch`, and
-CUDA is inferred from the single cuda that (Python, torch) builds against
-(`--cuda` names it only if a matrix ever carries two). Rebuilding the same
+passed); torch and CUDA are passed explicitly as `--torch` and `--cuda`.
+This also handles components such as TransformerEngine that build the same torch
+against multiple CUDA versions. Rebuilding the same
 tuple re-uploads (`--clobber`) wheels onto that same release; bumping a
 component's `ref` - or the matrix's torch/CUDA - starts **brand-new**
 releases under new tags, leaving the previous releases (and their wheels)

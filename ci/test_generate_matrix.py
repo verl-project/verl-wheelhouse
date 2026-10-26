@@ -4,11 +4,14 @@ import contextlib
 import io
 import json
 import re
+import shlex
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import yaml
 
 import build_index
 import generate_matrix
@@ -1026,6 +1029,111 @@ class CudaVersionFilterTests(unittest.TestCase):
                 self.versions, "demo", "3.12", DEMO_TORCH, "13.2.2"
             )
         self.assertTrue(meta["tag"].endswith("-cu132"))
+
+
+class TorchVersionFilterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.versions = make_cuda_matrix_versions({
+            "ref": "v1.2.3",
+            "path": "demo",
+            "builder": "demo",
+            "wheel_packages": ["demo"],
+            "runs_on": "ubuntu-24.04",
+        })
+        self.versions["build_matrix"] += [
+            dict(combo, torch="2.13.0")
+            for combo in self.versions["build_matrix"]
+        ]
+
+    def test_unset_filter_preserves_all_torch_versions(self) -> None:
+        self.assertEqual(
+            self.versions["build_matrix"],
+            generate_matrix.component_combos(self.versions, "demo"),
+        )
+
+    def test_torch_filter_applies_to_builds_and_release_keys(self) -> None:
+        self.versions["components"]["demo"]["torch_versions"] = [DEMO_TORCH]
+        rows = generate_matrix.build_matrix_entries(self.versions, "demo")
+        self.assertTrue(rows)
+        self.assertEqual({DEMO_TORCH}, {row["torch"] for row in rows})
+        self.assertEqual(
+            {DEMO_TORCH},
+            {torch for _, torch, _ in generate_matrix.component_release_keys(self.versions, "demo")},
+        )
+        # Index coverage must not require wheels for the opted-out ABI.
+        gaps = build_index.coverage_gaps(self.versions, {})
+        self.assertTrue(gaps)
+        self.assertEqual({"torch2.11"}, {gap["world"].split("/")[1] for gap in gaps})
+
+    def test_torch_filter_intersects_other_filters(self) -> None:
+        self.versions["components"]["demo"].update(
+            torch_versions=["2.13.0"], cuda_versions=[DEMO_CUDA],
+            python_versions=["3.12"], arches=["aarch64"],
+        )
+        combos = generate_matrix.component_combos(self.versions, "demo")
+        self.assertEqual(1, len(combos))
+        self.assertEqual(
+            ("aarch64", "3.12", DEMO_CUDA, "2.13.0"),
+            tuple(combos[0][key] for key in ("arch", "python", "cuda", "torch")),
+        )
+
+    def test_unknown_torch_version_is_rejected(self) -> None:
+        self.versions["components"]["demo"]["torch_versions"] = ["9.9.9"]
+        with self.assertRaisesRegex(SystemExit, "torch version.*not in build_matrix.*9.9.9"):
+            generate_matrix.component_combos(self.versions, "demo")
+
+    def test_empty_filter_disables_component(self) -> None:
+        self.versions["components"]["demo"]["torch_versions"] = []
+        self.assertEqual([], generate_matrix.component_combos(self.versions, "demo"))
+        self.assertEqual([], generate_matrix.component_release_keys(self.versions, "demo"))
+
+
+class ReleaseWorkflowTests(unittest.TestCase):
+    def test_workflow_metadata_matches_every_component_row(self) -> None:
+        versions = generate_matrix.load_versions()
+        workflow_path = (
+            Path(__file__).resolve().parents[1] / ".github/workflows/_build.yml"
+        )
+        workflow = yaml.load(workflow_path.read_text(), Loader=yaml.BaseLoader)
+        release_step = next(
+            step
+            for job in workflow["jobs"].values()
+            for step in job.get("steps", [])
+            if "python3 ci/release_meta.py" in step.get("run", "")
+        )
+        # Exercise the command actually used to publish. Matrix-only tests
+        # miss an omitted --cuda when one torch has two CUDA builds.
+        command = re.search(
+            r"python3 (ci/release_meta\.py.*?) > release-meta\.json",
+            release_step["run"], re.DOTALL,
+        ).group(1).replace("\\\n", " ")
+        rows = generate_matrix.build_full_matrix(
+            versions, generate_matrix.component_names(versions)
+        )
+        for row in rows:
+            with self.subTest(
+                component=row["component"],
+                arch=row["arch"], python=row["python"],
+                torch=row["torch"], cuda=row["cuda"],
+            ):
+                inputs = {
+                    "component": row["component"],
+                    "torch-version": row["torch"],
+                    "cuda-version": row["cuda"],
+                }
+                resolved = re.sub(
+                    r"\$\{\{ inputs\.([\w-]+) \}\}",
+                    lambda match: inputs[match.group(1)], command,
+                )
+                output = io.StringIO()
+                with patch.object(sys, "argv", shlex.split(resolved)), patch(
+                    "release_meta.runtime_python", return_value=row["python"]
+                ), contextlib.redirect_stdout(output):
+                    release_meta.main()
+                (meta,) = json.loads(output.getvalue())
+                self.assertEqual(row["release_tag"], meta["tag"])
+                self.assertEqual(row["cuda"], meta["cuda"])
+                self.assertEqual(row["torch"], meta["torch"])
 
 
 class PerPythonReleaseTests(unittest.TestCase):
