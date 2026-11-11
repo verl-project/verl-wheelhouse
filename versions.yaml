@@ -336,8 +336,10 @@ components:
     ref: v2.8.3 # FLASH_ATTENTION_VERSION in both verl Dockerfiles
     builder: flash_attention
     wheel_packages: [flash-attn]
-    cuda_versions: ["13.2.2"]
+    cuda_versions: ["13.0.2", "13.2.2"]
     torch_cuda_arch_list: "8.0;9.0;10.0;12.0"
+    patches:
+      - ci/patches/flash_attention_exclude_cute.patch
     requires_cudnn: false
     # CUDA 12.9+ nvcc routinely OOM-kills GitHub's 7 GB runners at max_jobs>1
     # (flash-attention's own CI forces MAX_JOBS=1 for cu129/cu130/cu132).
@@ -355,7 +357,8 @@ components:
         # x86_64-attached datacenter and consumer cards, so building them
         # here would only burn runner hours.
         torch_cuda_arch_list: "9.0;10.0"
-    extra_env: {}
+    extra_env:
+      FLASH_ATTN_LOCAL_VERSION: "cute_split.d51a4a1"
 
   apex:
     path: apex
