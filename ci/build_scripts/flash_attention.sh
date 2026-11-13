@@ -29,6 +29,8 @@ else
 fi
 export NVCC_THREADS="${NVCC_THREADS:-2}"
 
+git apply "${SCRIPT_DIR}/../patches/flash_attention_exclude_cute.patch"
+
 python setup.py bdist_wheel --dist-dir=dist
 
 echo "Built wheels:"

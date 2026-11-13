@@ -1,0 +1,16 @@
+From d51a4a1648d13bd348ddb8faef27580f3d903d88 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Keep FA4 CuTe files out of the FA2 wheel
+
+Backport the setup.py packaging separation from upstream #2282.
+
+--- a/setup.py
++++ b/setup.py
+@@ -606,6 +606,8 @@
+             "docs",
+             "benchmarks",
+             "flash_attn.egg-info",
++            "flash_attn.cute",
++            "flash_attn.cute.*",
+         )
+     ),
+     author="Tri Dao",
