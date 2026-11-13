@@ -27,6 +27,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  hosted-swap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free up disk space
+        run: |
+          source ci/runner/free_disk_space.sh
+          free_disk_space
+      - name: Verify hosted runner swap setup
+        run: |
+          swapon --show=NAME --noheadings | sort > /tmp/original-swap
+          bash ci/runner/setup_swap.sh
+          swapon --show=NAME --noheadings | sort > /tmp/active-swap
+          test -z "$(comm -23 /tmp/original-swap /tmp/active-swap)"
+          swap_file="$(swapon --show=NAME --noheadings | grep '^/swapfile-wheelhouse\.')"
+          test "$(sudo stat -c %s "$swap_file")" -eq 10737418240
+
   unit-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 5

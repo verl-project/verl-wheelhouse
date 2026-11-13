@@ -250,9 +250,7 @@ jobs:
 
       - name: Set up swap space
         if: runner.environment != 'self-hosted'
-        uses: pierotofy/set-swap-space@v1.0
-        with:
-          swap-size-gb: 10
+        run: bash ci/runner/setup_swap.sh
 
       - name: Provision build toolchain (Python, CUDA, cuDNN, PyTorch)
         uses: ./.github/actions/build-toolchain
