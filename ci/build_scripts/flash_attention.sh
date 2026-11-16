@@ -29,7 +29,12 @@ else
 fi
 export NVCC_THREADS="${NVCC_THREADS:-2}"
 
-git apply "${SCRIPT_DIR}/../patches/flash_attention_exclude_cute.patch"
+patch_file="${SCRIPT_DIR}/../patches/flash_attention_exclude_cute.patch"
+if git apply --reverse --check "${patch_file}" >/dev/null 2>&1; then
+  echo "Patch $(basename "${patch_file}") already applied; skipping."
+else
+  git apply "${patch_file}"
+fi
 
 python setup.py bdist_wheel --dist-dir=dist
 
