@@ -22,6 +22,8 @@ source "${SCRIPT_DIR}/lib/cuda_paths.sh"
 source "${SCRIPT_DIR}/lib/rdma_nvshmem.sh"
 # shellcheck source=ci/build_scripts/lib/wheel_pack.sh
 source "${SCRIPT_DIR}/lib/wheel_pack.sh"
+# shellcheck source=ci/build_scripts/lib/cxx20.sh
+source "${SCRIPT_DIR}/lib/cxx20.sh"
 
 export_extra_env
 
@@ -70,6 +72,8 @@ PY
 then
     python3 "${SCRIPT_DIR}/../patches/enable_deep_ep_sm80.py"
 fi
+
+upgrade_setup_py_to_cxx20_for_torch214 setup.py
 
 # The hybrid_ep extension links -lnvtx3interop and -lcuda. Both come from the
 # toolkit _build.yml installs: libnvtx3interop.so from its nvtx sub-package

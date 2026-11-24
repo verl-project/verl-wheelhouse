@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/env.sh"
 # shellcheck source=ci/build_scripts/lib/arch.sh
 source "${SCRIPT_DIR}/lib/arch.sh"
+# shellcheck source=ci/build_scripts/lib/cxx20.sh
+source "${SCRIPT_DIR}/lib/cxx20.sh"
 
 export_extra_env
 
@@ -35,6 +37,8 @@ if git apply --reverse --check "${patch_file}" >/dev/null 2>&1; then
 else
   git apply "${patch_file}"
 fi
+
+upgrade_setup_py_to_cxx20_for_torch214 setup.py
 
 python setup.py bdist_wheel --dist-dir=dist
 
