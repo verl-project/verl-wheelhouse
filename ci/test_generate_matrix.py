@@ -660,6 +660,19 @@ class RebuildScopeTests(unittest.TestCase):
         changed = self._changed(before, self._snapshot())
         self.assertEqual(changed, {n: set() for n in self.COMPONENTS})
 
+    def test_toolchain_transport_only_edit_has_no_influence(self) -> None:
+        before = self._snapshot()
+        self._append(
+            ".github/actions/build-toolchain/action.yml",
+            (
+                "# build-input-fingerprint: transport-only begin\n"
+                "TORCH_INDEX=https://mirror.example.invalid\n"
+                "# build-input-fingerprint: transport-only end\n"
+            ),
+        )
+        changed = self._changed(before, self._snapshot())
+        self.assertEqual(changed, {n: set() for n in self.COMPONENTS})
+
     def test_toolchain_edit_rebuilds_every_target(self) -> None:
         before = self._snapshot()
         self._append(".github/actions/build-toolchain/action.yml", "# bump cuda\n")

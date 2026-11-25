@@ -73,6 +73,17 @@ _SOURCE_DIRECTIVE_RE = re.compile(
     r"""(?m)^\s*(?:source|\.)\s+["']?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/([^"'\s]+)"""
 )
 
+# Download routing changes where bytes come from, not which bytes make the
+# wheel. Keep that transport-only block out of the toolchain content hash so
+# switching an official index to a byte-for-byte mirror does not invalidate
+# every published wheel. Everything outside the explicitly delimited block
+# remains fingerprinted and therefore rebuilds every affected target.
+_TOOLCHAIN_TRANSPORT_ONLY_RE = re.compile(
+    r"(?ms)^[ \t]*# build-input-fingerprint: transport-only begin\n"
+    r".*?"
+    r"^[ \t]*# build-input-fingerprint: transport-only end\n"
+)
+
 # Characters not in this set get collapsed to "-" when building a release tag
 # out of a git ref, since refs (e.g. branch names) aren't guaranteed to be
 # valid/clean git tag components on their own.
@@ -576,8 +587,12 @@ def build_input_fingerprint(
                 f"Component {component!r} fingerprints build input {key!r}, but that file "
                 "does not exist. Fix the builder's source directives or versions.yaml."
             )
+        content = path.read_bytes()
+        if rel == TOOLCHAIN_ACTION_REL:
+            text = content.decode("utf-8")
+            content = _TOOLCHAIN_TRANSPORT_ONLY_RE.sub("", text).encode("utf-8")
         fingerprint.append(
-            {"path": key, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            {"path": key, "sha256": hashlib.sha256(content).hexdigest()}
         )
     return fingerprint
 

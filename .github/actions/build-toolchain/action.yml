@@ -86,21 +86,18 @@ runs:
 
     - name: Install PyTorch ${{ inputs.torch-version }} (cu${{ inputs.cuda-version }})
       shell: bash
-      env:
-        RUNNER_ENVIRONMENT: ${{ runner.environment }}
       run: |
         pip install --upgrade pip
         TORCH_CUDA_TAG="cu$(echo '${{ inputs.cuda-version }}' | cut -d. -f1,2 | tr -d '.')"
-        if [[ "${RUNNER_ENVIRONMENT}" == "self-hosted" ]]; then
+        TORCH_INDEX="https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"
+        # build-input-fingerprint: transport-only begin
+        if [[ "${{ runner.environment }}" == "self-hosted" ]]; then
           # Aliyun mirrors the official CUDA indexes, including torch 2.14's
           # transitive cuda-toolkit wheels, and is much faster from the
           # self-hosted runners in China.
           TORCH_INDEX="https://mirrors.aliyun.com/pytorch-wheels/${TORCH_CUDA_TAG}"
-        else
-          # GitHub-hosted runners (including arm64) have fast access to the
-          # upstream index and should not take a cross-region detour to China.
-          TORCH_INDEX="https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"
         fi
+        # build-input-fingerprint: transport-only end
         # Drop any torch already on this interpreter BEFORE the index-pinned
         # install. Self-hosted x86_64 runners persist between jobs, so a build
         # from the previous CUDA matrix leaves torch 2.13.0+cu130 installed;
