@@ -89,7 +89,11 @@ runs:
       run: |
         pip install --upgrade pip
         TORCH_CUDA_TAG="cu$(echo '${{ inputs.cuda-version }}' | cut -d. -f1,2 | tr -d '.')"
-        TORCH_INDEX="https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"
+        # Aliyun mirrors the official PyTorch CUDA indexes, including the
+        # transitive cuda-toolkit wheels used by torch 2.14. Direct downloads
+        # from download.pytorch.org are prohibitively slow on the self-hosted
+        # runners, while the mirror covers every matrix arch/interpreter.
+        TORCH_INDEX="https://mirrors.aliyun.com/pytorch-wheels/${TORCH_CUDA_TAG}"
         # Drop any torch already on this interpreter BEFORE the index-pinned
         # install. Self-hosted x86_64 runners persist between jobs, so a build
         # from the previous CUDA matrix leaves torch 2.13.0+cu130 installed;
